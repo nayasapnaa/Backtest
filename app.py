@@ -2,19 +2,21 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
-from datetime import datetime, timedelta, time as dtime
 
 st.set_page_config(page_title="NIFTY Real Chart Backtest Lab", page_icon="📈", layout="centered")
 
 st.title("📈 NIFTY Real Chart Backtest Lab")
 st.caption("Upload your historical OHLCV CSV to backtest your exact Profit-Lock & Rejection strategy.")
 
-with st.expander("⚙️ Backtest Strategy Parameters", expanded=True):
+with st.expander("⚙️ Backtest Strategy Parameters & Filters", expanded=True):
     bt_capital = st.number_input("Backtest Initial Capital (₹)", value=150000.0, step=10000.0)
     bt_lot_size = st.number_input("Backtest Quantity / Lot Size", value=75, step=25)
     bt_costs = st.number_input("Round-trip cost per batch (₹)", value=40.0, step=5.0)
     bt_slippage = st.number_input("Estimated Slippage (Points)", value=1.0, step=0.5)
-    bt_min_spread = st.slider("Min EMA Separation Filter", min_value=1.0, max_value=10.0, value=2.0, step=0.5)
+    
+    # Flexibility toggles to prevent 0 trades
+    relax_filters = st.checkbox("Relax Rejection & VWAP Touch Filters (Easier entries)", value=True)
+    bt_min_spread = st.slider("Min EMA Separation Filter", min_value=0.0, max_value=5.0, value=0.5, step=0.5)
 
 uploaded_csv = st.file_uploader("Upload historical candles (CSV format)", type=["csv"], key="real_chart_csv")
 
@@ -26,11 +28,11 @@ def _normalise_columns(frame):
     ]
     aliases = {
         "datetime": "time", "timestamp": "time", "date_time": "time",
-        "date": "time", "time_stamp": "time", "vol": "volume",
+        "date": "time", "time_stamp": "time", "vol": "volume", "ltp": "close",
     }
     return frame.rename(columns={c: aliases.get(c, c) for c in frame.columns})
 
-def run_historical_backtest(frame, qty, cost_per_trade, slippage_points, min_spread):
+def run_historical_backtest(frame, qty, cost_per_trade, slippage_points, min_spread, relax):
     data = frame.copy()
     if "time" in data.columns:
         data["time"] = pd.to_datetime(data["time"], errors="coerce")
@@ -40,6 +42,10 @@ def run_historical_backtest(frame, qty, cost_per_trade, slippage_points, min_spr
         data["session"] = "single_session"
         data = data.reset_index(drop=True)
 
+    # Fill missing volume if absent
+    if "volume" not in data.columns:
+        data["volume"] = 1000
+
     trades = []
     equity = 0.0
     peak_equity = 0.0
@@ -48,10 +54,10 @@ def run_historical_backtest(frame, qty, cost_per_trade, slippage_points, min_spr
 
     for session_key, day in data.groupby("session", sort=False):
         day = day.copy().reset_index(drop=True)
-        if len(day) < 15:
+        if len(day) < 10:
             continue
 
-        # Calculate technical indicators for real chart
+        # Indicators
         typical = (day["high"] + day["low"] + day["close"]) / 3.0
         vol = day["volume"].clip(lower=0)
         cumulative_volume = vol.cumsum()
@@ -60,7 +66,6 @@ def run_historical_backtest(frame, qty, cost_per_trade, slippage_points, min_spr
         
         day["ema_fast"] = day["close"].ewm(span=9, adjust=False).mean()
         day["ema_slow"] = day["close"].ewm(span=21, adjust=False).mean()
-        day["macro_trend"] = day["close"].ewm(span=50, adjust=False).mean()
         
         opening_high = float(day.loc[:2, "high"].max())
         opening_low = float(day.loc[:2, "low"].min())
@@ -71,30 +76,28 @@ def run_historical_backtest(frame, qty, cost_per_trade, slippage_points, min_spr
         trades_today = 0
         session_trades_start = len(trades)
 
-        for i in range(4, len(day)):
+        for i in range(3, len(day)):
             row = day.iloc[i]
             exited_this_bar = False
             stamp = str(row["time"]) if "time" in day.columns else f"Candle {i+1}"
 
-            # Execute pending signal on open of next candle
             if pending is not None and active is None and trades_today < 5:
                 entry = float(row["open"]) + (slippage_points if pending["side"] == "LONG" else -slippage_points)
                 active = {
                     "side": pending["side"], 
                     "entry": entry, 
                     "entry_time": pending["time"],
-                    "stop": entry - 5.0 if pending["side"] == "LONG" else entry + 5.0, # Initial 5 pt SL
-                    "target": entry + 10.0 if pending["side"] == "LONG" else entry - 10.0, # Initial 10 pt target
+                    "stop": entry - 5.0 if pending["side"] == "LONG" else entry + 5.0,
+                    "target": entry + 10.0 if pending["side"] == "LONG" else entry - 10.0,
                     "profit_locked": False
                 }
                 trades_today += 1
                 pending = None
 
-            # Manage active position against high/low of current historical candle
             if active is not None:
                 current_profit_pts = (float(row["close"]) - active["entry"]) if active["side"] == "LONG" else (active["entry"] - float(row["close"]))
                 
-                # PROFIT LOCK SYSTEM: Check if profit crosses ₹500
+                # Profit Lock System: ₹500 profit triggers stop-loss at entry + 5 pts, target to 15 pts
                 if current_profit_pts * int(qty) >= 500.0 and not active["profit_locked"]:
                     active["profit_locked"] = True
                     active["stop"] = active["entry"] + 5.0 if active["side"] == "LONG" else active["entry"] - 5.0
@@ -117,14 +120,10 @@ def run_historical_backtest(frame, qty, cost_per_trade, slippage_points, min_spr
                     gross = (exit_price - active["entry"]) * int(qty) * sign
                     net = gross - float(cost_per_trade)
                     trades.append({
-                        "Session": str(session_key), 
-                        "Side": active["side"],
-                        "Entry time": active["entry_time"], 
-                        "Exit time": stamp,
-                        "Entry price": round(active["entry"], 2), 
-                        "Exit price": round(exit_price, 2),
-                        "Quantity": int(qty), 
-                        "Exit reason": exit_reason,
+                        "Session": str(session_key), "Side": active["side"],
+                        "Entry time": active["entry_time"], "Exit time": stamp,
+                        "Entry price": round(active["entry"], 2), "Exit price": round(exit_price, 2),
+                        "Quantity": int(qty), "Exit reason": exit_reason,
                         "Net P&L ₹": round(net, 2)
                     })
                     daily_net += net
@@ -138,37 +137,40 @@ def run_historical_backtest(frame, qty, cost_per_trade, slippage_points, min_spr
                 pending = None
                 continue
 
-            # Signal generation logic based on Rejection Candle & VWAP / EMA
             ema_fast_v = row["ema_fast"]
             ema_slow_v = row["ema_slow"]
             spread = abs(ema_fast_v - ema_slow_v)
 
             if active is None and pending is None and not exited_this_bar and spread >= min_spread:
-                high_v = float(row["high"])
-                low_v = float(row["low"])
                 close_v = float(row["close"])
                 open_v = float(row["open"])
-                total_rng = high_v - low_v
+                vwap_v = float(row["vwap"])
                 
-                if total_rng > 0:
+                if relax:
+                    # Relaxed Mode: Enters on clean momentum / crossover or basic pullback
+                    long_signal = close_v > open_v and (close_v > vwap_v or close_v > opening_high) and ema_fast_v > ema_slow_v
+                    short_signal = close_v < open_v and (close_v < vwap_v or close_v < opening_low) and ema_fast_v < ema_slow_v
+                else:
+                    # Strict Rejection Mode
+                    high_v = float(row["high"])
+                    low_v = float(row["low"])
+                    total_rng = high_v - low_v
                     lower_wk = min(close_v, open_v) - low_v
                     upper_wk = high_v - max(close_v, open_v)
-
-                    long_reject = (
-                        lower_wk > (total_rng * 0.45) and close_v > open_v
-                        and (low_v <= float(row["vwap"]) or low_v <= opening_high)
-                        and ema_fast_v > ema_slow_v
+                    
+                    long_signal = (
+                        total_rng > 0 and lower_wk > (total_rng * 0.4) and close_v > open_v
+                        and (low_v <= vwap_v or low_v <= opening_high) and ema_fast_v > ema_slow_v
                     )
-                    short_reject = (
-                        upper_wk > (total_rng * 0.45) and close_v < open_v
-                        and (high_v >= float(row["vwap"]) or high_v >= opening_low)
-                        and ema_fast_v < ema_slow_v
+                    short_signal = (
+                        total_rng > 0 and upper_wk > (total_rng * 0.4) and close_v < open_v
+                        and (high_v >= vwap_v or high_v >= opening_low) and ema_fast_v < ema_slow_v
                     )
 
-                    if long_reject:
-                        pending = {"side": "LONG", "time": stamp}
-                    elif short_reject:
-                        pending = {"side": "SHORT", "time": stamp}
+                if long_signal:
+                    pending = {"side": "LONG", "time": stamp}
+                elif short_signal:
+                    pending = {"side": "SHORT", "time": stamp}
 
         sessions.append({"Session": str(session_key), "Trades": len(trades) - session_trades_start, "Net P&L ₹": round(daily_net, 2)})
 
@@ -179,10 +181,13 @@ if uploaded_csv is not None:
         raw_bt = _normalise_columns(pd.read_csv(uploaded_csv))
         required_cols = {"open", "high", "low", "close"}
         if required_cols.issubset(raw_bt.columns):
-            st.success("✅ CSV successfully parsed with OHLC structure!")
+            st.success(f"✅ CSV loaded successfully! Total rows found: {len(raw_bt)}")
+            with st.expander("Preview uploaded data"):
+                st.dataframe(raw_bt.head(5))
+                
             if st.button("▶️ Run Real Chart Backtest", type="primary"):
                 results_df, sessions_df, max_dd = run_historical_backtest(
-                    raw_bt, bt_lot_size, bt_costs, bt_slippage, bt_min_spread
+                    raw_bt, bt_lot_size, bt_costs, bt_slippage, bt_min_spread, relax_filters
                 )
                 if not results_df.empty:
                     st.markdown("### 📊 Backtest Performance Summary")
@@ -201,8 +206,8 @@ if uploaded_csv is not None:
                         mime="text/csv"
                     )
                 else:
-                    st.warning("No trades were triggered. Try lowering the Min EMA Separation filter or checking your candle data format.")
+                    st.warning("⚠️ Still no trades triggered. Try checking if your CSV date range has enough candles per session (at least 15-20 rows) or toggle off the Min EMA Separation filter.")
         else:
-            st.error(f"Missing required columns. Your CSV must include: open, high, low, close. Found: {list(raw_bt.columns)}")
+            st.error(f"Missing required columns. Your CSV needs columns like: open, high, low, close. Found: {list(raw_bt.columns)}")
     except Exception as e:
         st.error(f"Error processing CSV: {e}")
