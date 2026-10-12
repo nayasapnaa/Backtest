@@ -52,7 +52,7 @@ speed = st.select_slider(
 with st.expander("⚙️ Expert Strategy & Risk Settings", expanded=False):
     capital = st.number_input("Practice capital (₹)", min_value=10000, max_value=250000, value=50000, step=5000)
     risk_pct = st.select_slider("Risk budget per trade (%)", options=[1.0, 1.5, 2.0], value=1.5)
-    daily_loss_pct = st.select_slider("Daily loss limit (%)", options=[1.0, 1.5, 2.0, 5.0], value=3.0)
+    daily_loss_pct = st.select_slider("Daily loss limit (%)", options=[1.0, 1.5, 2.0, 3.0, 5.0], value=3.0)
     target_r = st.select_slider("Target (R multiple)", options=[1.0, 1.5, 2.0, 2.5, 3.0], value=2.0)
     
     st.markdown("---")
@@ -131,7 +131,6 @@ def signal_for_state():
     if s["bar_index"] < 3 or s["opening_high"] is None:
         return "NO TRADE", "Waiting for opening range completion."
     
-    # Check time cutoff (Patient mode: no entries late in the session)
     current_t = s["sim_time"].time()
     cutoff_t = dtime(cutoff_hour, cutoff_minute)
     if current_t >= cutoff_t:
@@ -391,132 +390,4 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
         day["ema_slow"] = day["close"].ewm(span=21, adjust=False).mean()
         
         previous_close = day["close"].shift(1)
-        true_range = pd.concat([
-            day["high"] - day["low"],
-            (day["high"] - previous_close).abs(),
-            (day["low"] - previous_close).abs()
-        ], axis=1).max(axis=1)
-        day["atr"] = true_range.rolling(atr_period, min_periods=atr_period).mean()
-
-        p = 14
-        df_tr = true_range
-        up_move = day["high"] - day["high"].shift(1)
-        down_move = day["low"].shift(1) - day["low"]
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-        tr_smooth = pd.Series(df_tr).ewm(alpha=1/p, adjust=False).mean()
-        plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=1/p, adjust=False).mean() / tr_smooth.replace(0, np.nan))
-        minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=1/p, adjust=False).mean() / tr_smooth.replace(0, np.nan))
-        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-        day["adx"] = dx.ewm(alpha=1/p, adjust=False).mean()
-
-        opening_high = float(day.loc[:2, "high"].max())
-        opening_low = float(day.loc[:2, "low"].min())
-        active = None
-        pending = None
-        daily_net = 0.0
-        session_trades_start = len(trades)
-
-        for i in range(3, len(day)):
-            row = day.iloc[i]
-            exited_this_bar = False
-            stamp = str(row["time"]) if "time" in day.columns else f"{session_key} candle {i+1}"
-
-            # Check time cutoff if timestamp is available
-            if "time" in day.columns and pd.notna(row["time"]):
-                if row["time"].time() >= dtime(cut_h, cut_m):
-                    pending = None
-                    if active is not None:
-                        # Force close at cutoff
-                        pass
-
-            if pending is not None and active is None:
-                entry = float(row["open"]) + (slippage_points if pending["side"] == "LONG" else -slippage_points)
-                atr_value = float(pending["atr"])
-                stop_distance = max(atr_value * atr_stop_mult, 0.01)
-                target_distance = stop_distance * target_r
-                active = {
-                    "side": pending["side"], "entry": entry, "entry_time": pending["time"],
-                    "stop": entry - stop_distance if pending["side"] == "LONG" else entry + stop_distance,
-                    "target": entry + target_distance if pending["side"] == "LONG" else entry - target_distance,
-                    "risk_points": stop_distance
-                }
-                pending = None
-
-            if active is not None:
-                exit_price, exit_reason = None, None
-                if active["side"] == "LONG":
-                    if float(row["low"]) <= active["stop"]:
-                        exit_price, exit_reason = active["stop"] - slippage_points, "Stop-loss"
-                    elif float(row["high"]) >= active["target"]:
-                        exit_price, exit_reason = active["target"] - slippage_points, "Target"
-                else:
-                    if float(row["high"]) >= active["stop"]:
-                        exit_price, exit_reason = active["stop"] + slippage_points, "Stop-loss"
-                    elif float(row["low"]) <= active["target"]:
-                        exit_price, exit_reason = active["target"] + slippage_points, "Target"
-
-                if exit_price is not None:
-                    sign = 1 if active["side"] == "LONG" else -1
-                    gross = (exit_price - active["entry"]) * int(qty) * sign
-                    net = gross - float(cost_per_trade)
-                    trades.append({
-                        "Session": str(session_key), "Side": active["side"],
-                        "Entry time": active["entry_time"], "Exit time": stamp,
-                        "Entry price": round(active["entry"], 2), "Exit price": round(exit_price, 2),
-                        "Quantity": int(qty), "Exit reason": exit_reason,
-                        "Net P&L ₹": round(net, 2)
-                    })
-                    daily_net += net
-                    equity += net
-                    peak_equity = max(peak_equity, equity)
-                    max_drawdown = max(max_drawdown, peak_equity - equity)
-                    active = None
-                    exited_this_bar = True
-
-            if daily_net <= -(capital_value * daily_loss_pct_value / 100):
-                pending = None
-                continue
-
-            adx_val = row["adx"]
-            if active is None and pending is None and not exited_this_bar and pd.notna(adx_val):
-                if float(adx_val) >= min_adx and i > 0:
-                    close = float(row["close"])
-                    long_signal = (
-                        close > opening_high and close > float(row["vwap"])
-                        and float(row["ema_fast"]) > float(row["ema_slow"])
-                    )
-                    short_signal = (
-                        close < opening_low and close < float(row["vwap"])
-                        and float(row["ema_fast"]) < float(row["ema_slow"])
-                    )
-                    if long_signal:
-                        pending = {"side": "LONG", "atr": float(row["atr"]), "time": stamp}
-                    elif short_signal:
-                        pending = {"side": "SHORT", "atr": float(row["atr"]), "time": stamp}
-
-        sessions.append({"Session": str(session_key), "Trades": len(trades) - session_trades_start, "Net P&L ₹": round(daily_net, 2)})
-
-    return pd.DataFrame(trades), pd.DataFrame(sessions), max_drawdown
-
-if uploaded_csv is not None:
-    try:
-        raw_bt = _normalise_columns(pd.read_csv(uploaded_csv))
-        if {"open", "high", "low", "close"}.issubset(raw_bt.columns):
-            if "time" in raw_bt.columns:
-                raw_bt["time"] = pd.to_datetime(raw_bt["time"], errors="coerce")
-            
-            with st.expander("Backtest Parameters", expanded=True):
-                bt_qty = st.number_input("Backtest Quantity", value=75, key="bt_q")
-                bt_min_adx = st.slider("Backtest Min ADX Filter", min_value=10, max_value=30, value=22, key="bt_adx")
-            
-            if st.button("▶️ Run Uncapped Backtest", type="primary", key="run_bt"):
-                res_df, sess_df, m_dd = _run_expert_backtest(raw_bt, bt_qty, 40.0, 1.0, 150000.0, 3.0, 14, 1.5, 2.0, bt_min_adx, cutoff_hour, cutoff_minute)
-                if not res_df.empty:
-                    st.metric("Total Net P&L", f"₹{res_df['Net P&L ₹'].sum():,.2f}")
-                    st.metric("Total Trades Taken", len(res_df))
-                    st.dataframe(res_df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("No trades executed. Try adjusting the ADX threshold or checking data timestamps.")
-    except Exception as e:
-        st.error(f"Error: {e}")
+        true
