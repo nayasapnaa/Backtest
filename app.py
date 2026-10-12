@@ -234,7 +234,6 @@ def process_tick():
             exit_prem = pos["premium"]
             close_position("Profit target exceeded ₹400 (Auto-lock & Re-entry)", exit_prem)
             
-            # Execute identical re-entry with SL 1.5 lower than cost price and target 6 points higher
             new_entry = max(1.0, exit_prem)
             new_stop = max(1.0, new_entry - 1.5)
             new_target = new_entry + 6.0
@@ -274,7 +273,7 @@ def process_tick():
         halted = s["daily_pnl"] <= -daily_limit
         if (auto_execute and not halted and s["position"] is None and signal in ("BUY CALL", "BUY PUT")
                 and s["bar_index"] - s["last_trade_bar"] >= 2):
-            stop_distance = 1.5  # As requested: stoploss point 1.5 lower than cost price
+            stop_distance = 1.5
             risk_amount_per_lot = stop_distance * lot_size
             if risk_amount_per_lot <= risk_budget and capital >= base_premium * lot_size:
                 entry = max(1.0, base_premium + np.random.normal(0, 3))
@@ -522,4 +521,3 @@ if uploaded_csv is not None:
                     st.info("No trades executed. Adjust the EMA spread filter if needed.")
     except Exception as e:
         st.error(f"Error: {e}")
-.
