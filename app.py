@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timedelta, time as dtime
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="NIFTY Paper Trading Simulator", page_icon="📈", layout="centered")
+st.set_page_config(page_title="NIFTY Expert Paper Trading Simulator", page_icon="📈", layout="centered")
 
 defaults = {
     "running": False,
@@ -27,7 +27,7 @@ defaults = {
     "consecutive_losses": 0,
     "daily_pnl": 0.0,
     "last_signal": "NO TRADE",
-    "last_reason": "Waiting for clean trend momentum.",
+    "last_reason": "Waiting for high-probability rejection setup.",
     "last_trade_bar": -999,
     "bar_index": 0,
     "day_id": 1,
@@ -37,8 +37,8 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-st.title("📈 NIFTY Expert Momentum & Profit-Lock Lab")
-st.caption("EXPERT MODE • Initial SL: 5 pts • Auto Profit-Lock at ₹400 (SL shifts to +1.5 pts profit, Target: 6 pts)")
+st.title("📈 NIFTY Expert Rejection & Profit-Lock Lab")
+st.caption("EXPERT OPTIONS MODE • Max 5 Patient Trades • Rejection Pin Bars • VWAP & EMA • Multi-Tier Profit Locking")
 
 speed = st.select_slider(
     "⚡ Fast play speed",
@@ -51,13 +51,13 @@ with st.expander("⚙️ Expert Strategy & Risk Settings", expanded=True):
     capital = st.number_input("Practice capital (₹)", min_value=10000, max_value=250000, value=50000, step=5000)
     risk_pct = st.select_slider("Risk budget per trade (%)", options=[1.0, 1.5, 2.0], value=1.5)
     daily_loss_pct = st.select_slider("Daily loss limit (%)", options=[1.0, 1.5, 2.0, 3.0, 5.0], value=3.0)
-    target_r = st.select_slider("Target (R multiple)", options=[1.5, 2.0, 2.5, 3.0], value=2.0)
+    max_trades_session = 5  # Strict expert limit
     
     st.markdown("---")
-    st.subheader("🛡️ Momentum & Noise Filters")
-    min_ema_spread = st.slider("Min EMA Separation Filter (Points)", min_value=1.0, max_value=15.0, value=3.0, step=0.5)
-    cutoff_hour = st.slider("Session Trade Cutoff Hour", min_value=13, max_value=15, value=14, step=1)
-    cutoff_minute = st.slider("Session Trade Cutoff Minute", min_value=0, max_value=45, value=30, step=15)
+    st.subheader("🛡️ Price Action Rejection & Timing Rules")
+    min_ema_spread = st.slider("Min EMA Separation Filter", min_value=1.0, max_value=10.0, value=2.5, step=0.5)
+    cutoff_hour = 15  # Stop trading at 3:00 PM
+    cutoff_minute = 0
     
     st.markdown("---")
     auto_execute = st.checkbox("Automatic paper execution on confirmed signal", value=True)
@@ -115,47 +115,57 @@ def calculate_expert_indicators(candles):
 
 def signal_for_state():
     s = st.session_state
-    if s["bar_index"] < 3 or s["opening_high"] is None:
-        return "NO TRADE", "Waiting for opening range completion."
+    if s["bar_index"] < 4 or s["opening_high"] is None:
+        return "NO TRADE", "Waiting for opening range and candle structure."
     
     current_t = s["sim_time"].time()
     cutoff_t = dtime(cutoff_hour, cutoff_minute)
-    if current_t >= cutoff_t:
-        return "NO TRADE", f"Past time cutoff ({cutoff_hour:02d}:{cutoff_minute:02d}). No new entries."
+    if current_t >= cutoff_t or current_t < dtime(9, 15):
+        return "NO TRADE", "Outside trading window (9:15 AM - 3:00 PM)."
+
+    if s["trade_count"] >= max_trades_session:
+        return "NO TRADE", f"Reached maximum discipline limit of {max_trades_session} trades for the session."
 
     candles = s["candles"]
     last = candles[-1]
+    prev = candles[-2]
     vwap, ema_fast, ema_slow, atr = calculate_expert_indicators(candles)
     
     if vwap is None:
-        return "NO TRADE", "Gathering price data..."
+        return "NO TRADE", "Gathering market data..."
 
     ema_spread = abs(ema_fast - ema_slow)
     if ema_spread < min_ema_spread:
-        return "NO TRADE", f"EMA spread too tight ({ema_spread:.1f} < {min_ema_spread}). Market lacks clean directional momentum."
+        return "NO TRADE", f"EMA spread too narrow ({ema_spread:.1f}). Waiting for expansion."
 
-    bullish = (
-        last["close"] > s["opening_high"] 
-        and last["close"] > vwap 
-        and ema_fast > ema_slow 
-        and (ema_fast - ema_slow) >= min_ema_spread
+    # Rejection Candle Mastery (Pin Bar / Rejection Wick Check)
+    body = abs(last["close"] - last["open"])
+    total_range = last["high"] - last["low"]
+    lower_wick = min(last["close"], last["open"]) - last["low"]
+    upper_wick = last["high"] - max(last["close"], last["open"])
+
+    # Bullish Rejection: Long lower wick testing support (VWAP or opening range) with bullish close
+    is_bullish_rejection = (
+        lower_wick > (total_range * 0.5) 
         and last["close"] > last["open"]
+        and (last["low"] <= vwap or last["low"] <= s["opening_high"])
+        and ema_fast > ema_slow
     )
 
-    bearish = (
-        last["close"] < s["opening_low"] 
-        and last["close"] < vwap 
-        and ema_fast < ema_slow 
-        and (ema_slow - ema_fast) >= min_ema_spread
+    # Bearish Rejection: Long upper wick testing resistance with bearish close
+    is_bearish_rejection = (
+        upper_wick > (total_range * 0.5) 
         and last["close"] < last["open"]
+        and (last["high"] >= vwap or last["high"] >= s["opening_low"])
+        and ema_fast < ema_slow
     )
 
-    if bullish:
-        return "BUY CALL", f"Strong Bullish Momentum: Clean breakout with EMA spread {ema_spread:.1f}."
-    if bearish:
-        return "BUY PUT", f"Strong Bearish Momentum: Clean breakdown with EMA spread {ema_spread:.1f}."
+    if is_bullish_rejection:
+        return "BUY CALL", "Expert Rejection Confirmed: Bullish pin bar rejection at support with EMA & VWAP alignment."
+    if is_bearish_rejection:
+        return "BUY PUT", "Expert Rejection Confirmed: Bearish pin bar rejection at resistance with EMA & VWAP alignment."
         
-    return "NO TRADE", "Waiting for clear momentum expansion."
+    return "NO TRADE", "Patiently waiting for a clean rejection candle setup."
 
 def close_position(reason, exit_premium):
     s = st.session_state
@@ -222,17 +232,22 @@ def process_tick():
         
         pos["unrealized"] = (pos["premium"] - pos["entry_premium"]) * pos["quantity"] - pos["cost_estimate"]
         
-        # PROFIT LOCK LOGIC: When profit exceeds ₹400, lock profit by moving SL to +1.5 points in profit and target to 6 points
-        if pos["unrealized"] >= 400.0 and not pos.get("profit_locked", False):
+        # Expert Profit-Lock Rule: After hitting >= ₹500 profit, move stoploss to Entry + 5 points, then trail
+        if pos["unrealized"] >= 500.0 and not pos.get("profit_locked", False):
             pos["profit_locked"] = True
-            pos["stop_premium"] = pos["entry_premium"] + 1.5  # Locked 1.5 points in profit!
-            pos["target_premium"] = pos["entry_premium"] + 6.0 # Extended target to 6 points
+            pos["stop_premium"] = pos["entry_premium"] + 5.0  # Cost + 5 points locked profit
+            pos["target_premium"] = pos["entry_premium"] + 15.0 # Extend target
+
+        # Progressive trailing after profit lock
+        if pos.get("profit_locked", False) and pos["premium"] > pos["best_premium"]:
+            pos["best_premium"] = pos["premium"]
+            pos["stop_premium"] = max(pos["stop_premium"], pos["best_premium"] - 2.5) # Trail by 2.5 pts
 
         if pos["premium"] <= pos["stop_premium"]:
-            reason = "Profit Locked Stop-Loss hit (+1.5 pts)" if pos.get("profit_locked", False) else "Initial Stop-Loss hit (5 pts)"
+            reason = "Profit-Locked Trailing SL hit (+5 pts locked)" if pos.get("profit_locked", False) else "Initial Stop-Loss hit (5 pts)"
             close_position(reason, pos["premium"])
         elif pos["premium"] >= pos["target_premium"]:
-            close_position("Target hit", pos["premium"])
+            close_position("Target hit (10 pts)", pos["premium"])
 
     if s["ticks_in_candle"] >= s["candle_seconds"]:
         s["bar_index"] += 1
@@ -244,12 +259,12 @@ def process_tick():
         signal, reason = signal_for_state()
         s["last_signal"], s["last_reason"] = signal, reason
 
-        halted = s["daily_pnl"] <= -daily_limit
+        halted = s["daily_pnl"] <= -daily_limit or s["trade_count"] >= max_trades_session
         if (auto_execute and not halted and s["position"] is None and signal in ("BUY CALL", "BUY PUT")
-                and s["bar_index"] - s["last_trade_bar"] >= 2):
-            entry = max(1.0, base_premium + np.random.normal(0, 3))
-            stop = max(1.0, entry - 5.0)  # Initial stop-loss is 5 points below entry
-            target = entry + 6.0            # Target is 6 points
+                and s["bar_index"] - s["last_trade_bar"] >= 3):
+            entry = max(1.0, base_premium + np.random.normal(0, 2))
+            stop = max(1.0, entry - 5.0)  # Initial stop-loss: 5 points
+            target = entry + 10.0           # Initial target: 10 points
             s["position"] = {
                 "side": "CALL" if signal == "BUY CALL" else "PUT",
                 "entry_time": s["sim_time"].strftime("%H:%M:%S"),
@@ -293,21 +308,21 @@ m1, m2, m3, m4 = st.columns(4)
 m1.metric("Simulated NIFTY", f'{s["price"]:,.2f}', f'{s["price"]-s["prev_close"]:+.2f}')
 m2.metric("VWAP", f'{vwap:,.2f}' if vwap else "—")
 m3.metric("EMA Spread", f'{abs(ema_fast - ema_slow):.1f}' if ema_fast else "—")
-m4.metric("Candle timer", f'{s["candle_seconds"] - s["ticks_in_candle"]:02d}s')
+m4.metric("Trades Today", f'{s["trade_count"]}/{max_trades_session}')
 
 if s["opening_high"] is not None:
     st.write(f'**Opening Range:** {s["opening_low"]:,.2f} – {s["opening_high"]:,.2f}')
 else:
-    st.write("**Opening Range:** Waiting for opening range establishment.")
+    st.write("**Opening Range:** Waiting for establishment.")
 
 if display_signal == "BUY CALL":
-    st.success("🟢 BUY CALL — Momentum Breakout Confirmed")
+    st.success("🟢 BUY CALL — Rejection Pin Bar Confirmed")
 elif display_signal == "BUY PUT":
-    st.error("🔴 BUY PUT — Momentum Breakdown Confirmed")
+    st.error("🔴 BUY PUT — Rejection Pin Bar Confirmed")
 elif display_signal.startswith("POSITION OPEN"):
     st.info(f"📍 {display_signal}")
 else:
-    st.warning("⏸ WAITING FOR CLEAN MOMENTUM")
+    st.warning("⏸ PATIENTLY WAITING FOR REJECTION SETUP")
 st.write(s["last_reason"])
 
 if s["candles"]:
@@ -333,20 +348,20 @@ if pos:
     
     p4, p5, p6 = st.columns(3)
     p4.metric("Running P&L", f'₹{current_pnl:.2f}', delta=f'₹{current_pnl:.2f}')
-    p5.metric("Stop-loss", f'₹{pos["stop_premium"]:.2f} ({"LOCKED +1.5" if pos.get("profit_locked") else "Initial 5 pt"})')
+    p5.metric("Stop-loss", f'₹{pos["stop_premium"]:.2f} ({"LOCKED (+5 pts)" if pos.get("profit_locked") else "Initial 5 pt"})')
     p6.metric("Target", f'₹{pos["target_premium"]:.2f}')
 else:
-    st.info("No open position.")
+    st.info("No open position. Waiting for high-probability rejection setup.")
 
 r1, r2 = st.columns(2)
 r1.metric("Closed Session P&L", f'₹{s["daily_pnl"]:.2f}')
-r2.metric("Total Trades Executed", f'{s["trade_count"]}')
+r2.metric("Total Trades Executed", f'{s["trade_count"]}/{max_trades_session}')
 
 if s["closed_trades"]:
     st.dataframe(pd.DataFrame(s["closed_trades"]), use_container_width=True, hide_index=True)
 
 st.divider()
-st.subheader("3. Historical Backtest Lab (Profit-Lock Enabled)")
+st.subheader("3. Historical Backtest Lab (Expert Rejection & Profit-Lock)")
 uploaded_csv = st.file_uploader("Upload historical candles (CSV)", type=["csv"], key="backtest_csv")
 
 def _normalise_columns(frame):
@@ -392,9 +407,10 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
         active = None
         pending = None
         daily_net = 0.0
+        trades_today = 0
         session_trades_start = len(trades)
 
-        for i in range(3, len(day)):
+        for i in range(4, len(day)):
             row = day.iloc[i]
             exited_this_bar = False
             stamp = str(row["time"]) if "time" in day.columns else f"{session_key} candle {i+1}"
@@ -403,34 +419,34 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
                 if row["time"].time() >= dtime(cut_h, cut_m):
                     pending = None
 
-            if pending is not None and active is None:
+            if pending is not None and active is None and trades_today < 5:
                 entry = float(row["open"]) + (slippage_points if pending["side"] == "LONG" else -slippage_points)
                 active = {
                     "side": pending["side"], "entry": entry, "entry_time": pending["time"],
                     "stop": entry - 5.0 if pending["side"] == "LONG" else entry + 5.0,
-                    "target": entry + 6.0 if pending["side"] == "LONG" else entry - 6.0,
+                    "target": entry + 10.0 if pending["side"] == "LONG" else entry - 10.0,
                     "profit_locked": False
                 }
+                trades_today += 1
                 pending = None
 
             if active is not None:
-                # Check profit lock condition in backtest (rough proxy via high/low or close)
                 current_profit_pts = (float(row["close"]) - active["entry"]) if active["side"] == "LONG" else (active["entry"] - float(row["close"]))
-                if current_profit_pts * int(qty) >= 400.0 and not active["profit_locked"]:
+                if current_profit_pts * int(qty) >= 500.0 and not active["profit_locked"]:
                     active["profit_locked"] = True
-                    active["stop"] = active["entry"] + 1.5 if active["side"] == "LONG" else active["entry"] - 1.5
+                    active["stop"] = active["entry"] + 5.0 if active["side"] == "LONG" else active["entry"] - 5.0
 
                 exit_price, exit_reason = None, None
                 if active["side"] == "LONG":
                     if float(row["low"]) <= active["stop"]:
-                        exit_price, exit_reason = active["stop"] - slippage_points, "Stop-loss (Locked)" if active["profit_locked"] else "Stop-loss (5 pt)"
+                        exit_price, exit_reason = active["stop"] - slippage_points, "Stop-loss (Locked +5)" if active["profit_locked"] else "Stop-loss (5 pt)"
                     elif float(row["high"]) >= active["target"]:
-                        exit_price, exit_reason = active["target"] - slippage_points, "Target"
+                        exit_price, exit_reason = active["target"] - slippage_points, "Target (10 pt)"
                 else:
                     if float(row["high"]) >= active["stop"]:
-                        exit_price, exit_reason = active["stop"] + slippage_points, "Stop-loss (Locked)" if active["profit_locked"] else "Stop-loss (5 pt)"
+                        exit_price, exit_reason = active["stop"] + slippage_points, "Stop-loss (Locked +5)" if active["profit_locked"] else "Stop-loss (5 pt)"
                     elif float(row["low"]) <= active["target"]:
-                        exit_price, exit_reason = active["target"] + slippage_points, "Target"
+                        exit_price, exit_reason = active["target"] + slippage_points, "Target (10 pt)"
 
                 if exit_price is not None:
                     sign = 1 if active["side"] == "LONG" else -1
@@ -450,7 +466,7 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
                     active = None
                     exited_this_bar = True
 
-            if daily_net <= -(capital_value * daily_loss_pct_value / 100):
+            if daily_net <= -(capital_value * daily_loss_pct_value / 100) or trades_today >= 5:
                 pending = None
                 continue
 
@@ -458,19 +474,29 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
             ema_slow_v = row["ema_slow"]
             spread = abs(ema_fast_v - ema_slow_v)
 
-            if active is None and pending is None and not exited_this_bar and spread >= min_spread:
-                close = float(row["close"])
-                long_signal = (
-                    close > opening_high and close > float(row["vwap"])
-                    and ema_fast_v > ema_slow_v and close > float(row["open"])
+            if active is None and pending is None and not exited_this_bar and spread >= min_spread and trades_today < 5:
+                high_v = float(row["high"])
+                low_v = float(row["low"])
+                close_v = float(row["close"])
+                open_v = float(row["open"])
+                total_rng = high_v - low_v
+                lower_wk = min(close_v, open_v) - low_v
+                upper_wk = high_v - max(close_v, open_v)
+
+                long_reject = (
+                    lower_wk > (total_rng * 0.5) and close_v > open_v
+                    and (low_v <= float(row["vwap"]) or low_v <= opening_high)
+                    and ema_fast_v > ema_slow_v
                 )
-                short_signal = (
-                    close < opening_low and close < float(row["vwap"])
-                    and ema_fast_v < ema_slow_v and close < float(row["open"])
+                short_reject = (
+                    upper_wk > (total_rng * 0.5) and close_v < open_v
+                    and (high_v >= float(row["vwap"]) or high_v >= opening_low)
+                    and ema_fast_v < ema_slow_v
                 )
-                if long_signal:
+
+                if long_reject:
                     pending = {"side": "LONG", "time": stamp}
-                elif short_signal:
+                elif short_reject:
                     pending = {"side": "SHORT", "time": stamp}
 
         sessions.append({"Session": str(session_key), "Trades": len(trades) - session_trades_start, "Net P&L ₹": round(daily_net, 2)})
@@ -486,15 +512,15 @@ if uploaded_csv is not None:
             
             with st.expander("Backtest Parameters", expanded=True):
                 bt_qty = st.number_input("Backtest Quantity", value=75, key="bt_q")
-                bt_min_spread = st.slider("Backtest Min EMA Spread", min_value=1.0, max_value=10.0, value=3.0, key="bt_spread")
+                bt_min_spread = st.slider("Backtest Min EMA Spread", min_value=1.0, max_value=10.0, value=2.5, key="bt_spread")
             
-            if st.button("▶️ Run Momentum Backtest", type="primary", key="run_bt"):
+            if st.button("▶️ Run Expert Backtest", type="primary", key="run_bt"):
                 res_df, sess_df, m_dd = _run_expert_backtest(raw_bt, bt_qty, 40.0, 1.0, 150000.0, 3.0, 14, bt_min_spread, cutoff_hour, cutoff_minute)
                 if not res_df.empty:
                     st.metric("Total Net P&L", f"₹{res_df['Net P&L ₹'].sum():,.2f}")
                     st.metric("Total Trades Taken", len(res_df))
                     st.dataframe(res_df, use_container_width=True, hide_index=True)
                 else:
-                    st.info("No trades executed. Adjust the EMA spread filter if needed.")
+                    st.info("No trades executed. Rejection filters successfully suppressed low-probability setups.")
     except Exception as e:
         st.error(f"Error: {e}")
