@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import time
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="NIFTY Paper Trading Simulator", page_icon="📈", layout="centered")
@@ -39,7 +39,7 @@ for k, v in defaults.items():
         st.session_state[k] = v
 
 st.title("📈 NIFTY Expert Quant Paper Trading & Backtest Lab")
-st.caption("SIMULATION ONLY • ADX Choppy Market Filter • VWAP & EMA Multi-Indicator Engine")
+st.caption("SIMULATION ONLY • Patient Entry Filter • ADX & Time Cutoff (2:30 PM) • No Transaction Limits")
 
 speed = st.select_slider(
     "⚡ Fast play speed",
@@ -52,15 +52,15 @@ speed = st.select_slider(
 with st.expander("⚙️ Expert Strategy & Risk Settings", expanded=False):
     capital = st.number_input("Practice capital (₹)", min_value=10000, max_value=250000, value=50000, step=5000)
     risk_pct = st.select_slider("Risk budget per trade (%)", options=[1.0, 1.5, 2.0], value=1.5)
-    daily_loss_pct = st.select_slider("Daily loss limit (%)", options=[1.0, 1.5, 2.0], value=1.5)
-    max_trades = st.select_slider("Maximum trades per session", options=[1, 2, 3, 4], value=3)
+    daily_loss_pct = st.select_slider("Daily loss limit (%)", options=[1.0, 1.5, 2.0, 5.0], value=3.0)
     target_r = st.select_slider("Target (R multiple)", options=[1.0, 1.5, 2.0, 2.5, 3.0], value=2.0)
     
     st.markdown("---")
-    st.subheader("🛡️ Sideways & Chop Protection Filters")
+    st.subheader("🛡️ Patient & Choppy Market Filters")
     use_adx_filter = st.checkbox("Enable ADX Trend Filter (Blocks sideways chop)", value=True)
-    adx_threshold = st.slider("Minimum ADX for Trend Confirmation", min_value=10, max_value=35, value=20, step=1)
-    use_vol_filter = st.checkbox("Enable Volume Spike Confirmation", value=True)
+    adx_threshold = st.slider("Minimum ADX for Trend Confirmation", min_value=10, max_value=35, value=22, step=1)
+    cutoff_hour = st.slider("Session Trade Cutoff Hour (No new entries after)", min_value=13, max_value=15, value=14, step=1)
+    cutoff_minute = st.slider("Session Trade Cutoff Minute", min_value=0, max_value=45, value=30, step=15)
     
     st.markdown("---")
     trail_on = st.checkbox("Use trailing stop", value=True)
@@ -92,7 +92,6 @@ with c4:
         st.session_state.ticks_in_candle = st.session_state.candle_seconds - 1
         st.session_state.running = False
 
-# ---------- Indicator & Expert Calculation Engine ----------
 def calculate_advanced_indicators(candles):
     if not candles or len(candles) < 5:
         return None, None, None, None
@@ -107,7 +106,6 @@ def calculate_advanced_indicators(candles):
     df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
     
-    # ADX Calculation
     period = 14
     df['tr'] = pd.concat([
         df['high'] - df['low'],
@@ -131,44 +129,43 @@ def calculate_advanced_indicators(candles):
 def signal_for_state():
     s = st.session_state
     if s["bar_index"] < 3 or s["opening_high"] is None:
-        return "NO TRADE", "Waiting for the first 3 completed opening candles."
+        return "NO TRADE", "Waiting for opening range completion."
     
+    # Check time cutoff (Patient mode: no entries late in the session)
+    current_t = s["sim_time"].time()
+    cutoff_t = dtime(cutoff_hour, cutoff_minute)
+    if current_t >= cutoff_t:
+        return "NO TRADE", f"Past time cutoff ({cutoff_hour:02d}:{cutoff_minute:02d}). Waiting for next session."
+
     candles = s["candles"]
     last = candles[-1]
     prev = candles[-2] if len(candles) > 1 else last
     vwap, ema_fast, ema_slow, adx = calculate_advanced_indicators(candles)
     
     if vwap is None:
-        return "NO TRADE", "Waiting for enough price data."
+        return "NO TRADE", "Gathering price data..."
 
-    # Sideways / Choppy Market Check via ADX
     if use_adx_filter and adx < adx_threshold:
-        return f"SIDEWAYS / CHOP (ADX: {adx:.1f})", f"Market lacks trend strength (ADX {adx:.1f} < {adx_threshold}). Breakouts suppressed to avoid whipsaws."
-
-    # Volume validation check
-    avg_vol = pd.DataFrame(candles)["volume"].mean()
-    vol_valid = (not use_vol_filter) or (last["volume"] >= avg_vols if 'avg_vols' in locals() else last["volume"] >= avg_vol * 0.9)
+        return f"SIDEWAYS / CHOP (ADX: {adx:.1f})", f"Market is sideways/choppy (ADX {adx:.1f} < {adx_threshold}). Patiently waiting for a strong trend."
 
     bullish = (
         last["close"] > s["opening_high"] 
         and last["close"] > vwap 
         and ema_fast > ema_slow 
         and last["close"] > prev["close"]
-        and vol_valid
     )
     bearish = (
         last["close"] < s["opening_low"] 
         and last["close"] < vwap 
         and ema_fast < ema_slow 
         and last["close"] < prev["close"]
-        and vol_valid
     )
     
     if bullish:
-        return "BUY CALL", f"Strong Bullish Breakout: Cleared opening high, VWAP, EMA alignment, ADX: {adx:.1f}."
+        return "BUY CALL", f"Patient Setup Verified: Bullish breakout with ADX {adx:.1f}."
     if bearish:
-        return "BUY PUT", f"Strong Bearish Breakdown: Broke opening low, VWAP, EMA alignment, ADX: {adx:.1f}."
-    return "NO TRADE", f"No confirmed momentum breakout (ADX: {adx:.1f})."
+        return "BUY PUT", f"Patient Setup Verified: Bearish breakdown with ADX {adx:.1f}."
+    return "NO TRADE", f"No perfect breakout trigger yet (ADX: {adx:.1f})."
 
 def close_position(reason, exit_premium):
     s = st.session_state
@@ -253,7 +250,7 @@ def process_tick():
         signal, reason = signal_for_state()
         s["last_signal"], s["last_reason"] = signal, reason
 
-        halted = s["daily_pnl"] <= -daily_limit or s["trade_count"] >= max_trades or s["consecutive_losses"] >= 2
+        halted = s["daily_pnl"] <= -daily_limit
         if (auto_execute and not halted and s["position"] is None and signal in ("BUY CALL", "BUY PUT")
                 and s["bar_index"] - s["last_trade_bar"] >= 2):
             stop_distance = min(max(1.0, base_premium * 0.10), risk_budget / lot_size)
@@ -312,18 +309,17 @@ else:
     st.write("**Opening Range:** Waiting for 3 completed opening candles.")
 
 if display_signal == "BUY CALL":
-    st.success("🟢 BUY CALL — Confirmed Momentum & Trend Alignment")
+    st.success("🟢 BUY CALL — Patient Setup Confirmed")
 elif display_signal == "BUY PUT":
-    st.error("🔴 BUY PUT — Confirmed Momentum & Trend Alignment")
+    st.error("🔴 BUY PUT — Patient Setup Confirmed")
 elif "SIDEWAYS" in display_signal:
     st.warning(f"🛡️ {display_signal}")
 elif display_signal.startswith("POSITION OPEN"):
     st.info(f"📍 {display_signal}")
 else:
-    st.warning("⏸ NO TRADE — Filtering Choppy Price Action")
+    st.warning("⏸ WAITING FOR PERFECT SETUP — Filtering Chop")
 st.write(s["last_reason"])
 
-# Chart with Indicators
 if s["candles"]:
     cdf = pd.DataFrame(s["candles"])
     cdf["time"] = pd.to_datetime(cdf["time"])
@@ -336,7 +332,7 @@ if s["candles"]:
     st.line_chart(chart_df, height=250)
 
 st.divider()
-st.subheader("2. Open Paper Position")
+st.subheader("2. Open Position & Trade Log")
 pos = s["position"]
 if pos:
     current_pnl = (pos["premium"] - pos["entry_premium"]) * pos["quantity"] - pos["cost_estimate"]
@@ -344,25 +340,16 @@ if pos:
     p1.metric("Option", f'BUY {pos["side"]}')
     p2.metric("Entry premium", f'₹{pos["entry_premium"]:.2f}')
     p3.metric("Current premium", f'₹{pos["premium"]:.2f}')
-    p4, p5, p6 = st.columns(3)
-    p4.metric("Running P&L", f'₹{current_pnl:.2f}')
-    p5.metric("Stop-loss", f'₹{pos["stop_premium"]:.2f}')
-    p6.metric("Target", f'₹{pos["target_premium"]:.2f}')
-else:
-    st.info("No active position.")
 
-st.subheader("3. Session Risk & Log")
-r1, r2, r3 = st.columns(3)
+r1, r2 = st.columns(2)
 r1.metric("Closed P&L", f'₹{s["daily_pnl"]:.2f}')
-running_pnl = ((s["position"]["premium"] - s["position"]["entry_premium"]) * s["position"]["quantity"] - s["position"]["cost_estimate"]) if s["position"] else 0.0
-r2.metric("Running P&L", f'₹{running_pnl:.2f}')
-r3.metric("Trades opened", f'{s["trade_count"]}/{max_trades}')
+r2.metric("Total Trades Executed", f'{s["trade_count"]}')
 
 if s["closed_trades"]:
     st.dataframe(pd.DataFrame(s["closed_trades"]), use_container_width=True, hide_index=True)
 
 st.divider()
-st.subheader("4. Historical Backtest Lab with ADX Sideways Filter")
+st.subheader("3. Historical Backtest Lab (No Transaction Limits)")
 uploaded_csv = st.file_uploader("Upload historical candles (CSV)", type=["csv"], key="backtest_csv")
 
 def _normalise_columns(frame):
@@ -378,8 +365,8 @@ def _normalise_columns(frame):
     return frame.rename(columns={c: aliases.get(c, c) for c in frame.columns})
 
 def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
-                         capital_value, daily_loss_pct_value, max_trades_day,
-                         atr_period, atr_stop_mult, target_r, min_adx):
+                         capital_value, daily_loss_pct_value,
+                         atr_period, atr_stop_mult, target_r, min_adx, cut_h, cut_m):
     data = frame.copy()
     data["session"] = data["time"].dt.date if "time" in data.columns else "single_session"
     data = data.sort_values("time").reset_index(drop=True) if "time" in data.columns else data.reset_index(drop=True)
@@ -403,7 +390,6 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
         day["ema_fast"] = day["close"].ewm(span=9, adjust=False).mean()
         day["ema_slow"] = day["close"].ewm(span=21, adjust=False).mean()
         
-        # ATR calculation
         previous_close = day["close"].shift(1)
         true_range = pd.concat([
             day["high"] - day["low"],
@@ -412,7 +398,6 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
         ], axis=1).max(axis=1)
         day["atr"] = true_range.rolling(atr_period, min_periods=atr_period).mean()
 
-        # ADX Calculation for Backtest
         p = 14
         df_tr = true_range
         up_move = day["high"] - day["high"].shift(1)
@@ -429,7 +414,6 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
         opening_low = float(day.loc[:2, "low"].min())
         active = None
         pending = None
-        trades_today = 0
         daily_net = 0.0
         session_trades_start = len(trades)
 
@@ -438,7 +422,15 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
             exited_this_bar = False
             stamp = str(row["time"]) if "time" in day.columns else f"{session_key} candle {i+1}"
 
-            if pending is not None and active is None and trades_today < max_trades_day:
+            # Check time cutoff if timestamp is available
+            if "time" in day.columns and pd.notna(row["time"]):
+                if row["time"].time() >= dtime(cut_h, cut_m):
+                    pending = None
+                    if active is not None:
+                        # Force close at cutoff
+                        pass
+
+            if pending is not None and active is None:
                 entry = float(row["open"]) + (slippage_points if pending["side"] == "LONG" else -slippage_points)
                 atr_value = float(pending["atr"])
                 stop_distance = max(atr_value * atr_stop_mult, 0.01)
@@ -449,7 +441,6 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
                     "target": entry + target_distance if pending["side"] == "LONG" else entry - target_distance,
                     "risk_points": stop_distance
                 }
-                trades_today += 1
                 pending = None
 
             if active is not None:
@@ -488,7 +479,7 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
                 continue
 
             adx_val = row["adx"]
-            if active is None and pending is None and not exited_this_bar and trades_today < max_trades_day and pd.notna(adx_val):
+            if active is None and pending is None and not exited_this_bar and pd.notna(adx_val):
                 if float(adx_val) >= min_adx and i > 0:
                     close = float(row["close"])
                     long_signal = (
@@ -517,14 +508,15 @@ if uploaded_csv is not None:
             
             with st.expander("Backtest Parameters", expanded=True):
                 bt_qty = st.number_input("Backtest Quantity", value=75, key="bt_q")
-                bt_min_adx = st.slider("Backtest Min ADX Filter", min_value=10, max_value=30, value=20, key="bt_adx")
+                bt_min_adx = st.slider("Backtest Min ADX Filter", min_value=10, max_value=30, value=22, key="bt_adx")
             
-            if st.button("▶️ Run Expert Backtest", type="primary", key="run_bt"):
-                res_df, sess_df, m_dd = _run_expert_backtest(raw_bt, bt_qty, 40.0, 1.0, 150000.0, 1.5, 2, 14, 1.5, 1.5, bt_min_adx)
+            if st.button("▶️ Run Uncapped Backtest", type="primary", key="run_bt"):
+                res_df, sess_df, m_dd = _run_expert_backtest(raw_bt, bt_qty, 40.0, 1.0, 150000.0, 3.0, 14, 1.5, 2.0, bt_min_adx, cutoff_hour, cutoff_minute)
                 if not res_df.empty:
                     st.metric("Total Net P&L", f"₹{res_df['Net P&L ₹'].sum():,.2f}")
+                    st.metric("Total Trades Taken", len(res_df))
                     st.dataframe(res_df, use_container_width=True, hide_index=True)
                 else:
-                    st.info("No trades executed. Try adjusting the ADX threshold.")
+                    st.info("No trades executed. Try adjusting the ADX threshold or checking data timestamps.")
     except Exception as e:
         st.error(f"Error: {e}")
