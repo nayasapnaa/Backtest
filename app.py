@@ -37,8 +37,8 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-st.title("📈 NIFTY Expert Momentum & Trend Quant Lab")
-st.caption("EXPERT MODE • Clean EMA Cross & VWAP Momentum • Optimized Stop-Loss Buffers")
+st.title("📈 NIFTY Expert Momentum & Profit-Lock Lab")
+st.caption("EXPERT MODE • Auto Profit Lock at ₹400 & Instant Re-Entry (SL: 1.5 pts, Target: 6 pts)")
 
 speed = st.select_slider(
     "⚡ Fast play speed",
@@ -136,7 +136,6 @@ def signal_for_state():
     if ema_spread < min_ema_spread:
         return "NO TRADE", f"EMA spread too tight ({ema_spread:.1f} < {min_ema_spread}). Market lacks clean directional momentum."
 
-    # Clean Momentum Breakout with Proper EMA separation and VWAP alignment
     bullish = (
         last["close"] > s["opening_high"] 
         and last["close"] > vwap 
@@ -228,7 +227,36 @@ def process_tick():
             pos["stop_premium"] = max(pos["stop_premium"], pos["best_premium"] - pos["risk_per_unit"])
             
         pos["unrealized"] = (pos["premium"] - pos["entry_premium"]) * pos["quantity"] - pos["cost_estimate"]
-        if pos["premium"] <= pos["stop_premium"]:
+        
+        # Rule: When profit exceeds 400, close that position and execute another same transaction with SL 1.5 lower and target 6 points higher
+        if pos["unrealized"] >= 400.0:
+            side_to_reenter = pos["side"]
+            exit_prem = pos["premium"]
+            close_position("Profit target exceeded ₹400 (Auto-lock & Re-entry)", exit_prem)
+            
+            # Execute identical re-entry with SL 1.5 lower than cost price and target 6 points higher
+            new_entry = max(1.0, exit_prem)
+            new_stop = max(1.0, new_entry - 1.5)
+            new_target = new_entry + 6.0
+            s["position"] = {
+                "side": side_to_reenter,
+                "entry_time": s["sim_time"].strftime("%H:%M:%S"),
+                "entry_underlying": s["price"],
+                "last_underlying": s["price"],
+                "entry_premium": new_entry,
+                "premium": new_entry,
+                "quantity": lot_size,
+                "stop_premium": new_stop,
+                "initial_stop": new_stop,
+                "target_premium": new_target,
+                "risk_per_unit": 1.5,
+                "best_premium": new_entry,
+                "cost_estimate": costs_per_trade,
+                "unrealized": -costs_per_trade,
+            }
+            s["trade_count"] += 1
+            
+        elif pos["premium"] <= pos["stop_premium"]:
             close_position("Stop-loss / trailing stop", pos["premium"])
         elif pos["premium"] >= pos["target_premium"]:
             close_position("Target hit", pos["premium"])
@@ -246,12 +274,12 @@ def process_tick():
         halted = s["daily_pnl"] <= -daily_limit
         if (auto_execute and not halted and s["position"] is None and signal in ("BUY CALL", "BUY PUT")
                 and s["bar_index"] - s["last_trade_bar"] >= 2):
-            stop_distance = min(max(1.0, base_premium * 0.15), risk_budget / lot_size)
+            stop_distance = 1.5  # As requested: stoploss point 1.5 lower than cost price
             risk_amount_per_lot = stop_distance * lot_size
             if risk_amount_per_lot <= risk_budget and capital >= base_premium * lot_size:
                 entry = max(1.0, base_premium + np.random.normal(0, 3))
-                stop = max(1.0, entry - stop_distance)
-                target = entry + stop_distance * target_r
+                stop = max(1.0, entry - 1.5)
+                target = entry + 6.0
                 s["position"] = {
                     "side": "CALL" if signal == "BUY CALL" else "PUT",
                     "entry_time": s["sim_time"].strftime("%H:%M:%S"),
@@ -263,7 +291,7 @@ def process_tick():
                     "stop_premium": stop,
                     "initial_stop": stop,
                     "target_premium": target,
-                    "risk_per_unit": stop_distance,
+                    "risk_per_unit": 1.5,
                     "best_premium": entry,
                     "cost_estimate": costs_per_trade,
                     "unrealized": -costs_per_trade,
@@ -347,7 +375,7 @@ if s["closed_trades"]:
     st.dataframe(pd.DataFrame(s["closed_trades"]), use_container_width=True, hide_index=True)
 
 st.divider()
-st.subheader("3. Historical Backtest Lab (Momentum & Spread Filter)")
+st.subheader("3. Historical Backtest Lab (Profit-Lock & Re-Entry Enabled)")
 uploaded_csv = st.file_uploader("Upload historical candles (CSV)", type=["csv"], key="backtest_csv")
 
 def _normalise_columns(frame):
@@ -364,7 +392,7 @@ def _normalise_columns(frame):
 
 def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
                          capital_value, daily_loss_pct_value,
-                         atr_period, atr_stop_mult, target_r, min_spread, cut_h, cut_m):
+                         atr_period, min_spread, cut_h, cut_m):
     data = frame.copy()
     data["session"] = data["time"].dt.date if "time" in data.columns else "single_session"
     data = data.sort_values("time").reset_index(drop=True) if "time" in data.columns else data.reset_index(drop=True)
@@ -388,14 +416,6 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
         day["ema_fast"] = day["close"].ewm(span=9, adjust=False).mean()
         day["ema_slow"] = day["close"].ewm(span=21, adjust=False).mean()
         
-        previous_close = day["close"].shift(1)
-        true_range = pd.concat([
-            day["high"] - day["low"],
-            (day["high"] - previous_close).abs(),
-            (day["low"] - previous_close).abs()
-        ], axis=1).max(axis=1)
-        day["atr"] = true_range.rolling(atr_period, min_periods=1).mean()
-
         opening_high = float(day.loc[:2, "high"].max())
         opening_low = float(day.loc[:2, "low"].min())
         active = None
@@ -414,14 +434,12 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
 
             if pending is not None and active is None:
                 entry = float(row["open"]) + (slippage_points if pending["side"] == "LONG" else -slippage_points)
-                atr_value = float(pending["atr"])
-                stop_distance = max(atr_value * atr_stop_mult, 0.01)
-                target_distance = stop_distance * target_r
+                stop_distance = 1.5
+                target_distance = 6.0
                 active = {
                     "side": pending["side"], "entry": entry, "entry_time": pending["time"],
                     "stop": entry - stop_distance if pending["side"] == "LONG" else entry + stop_distance,
                     "target": entry + target_distance if pending["side"] == "LONG" else entry - target_distance,
-                    "risk_points": stop_distance
                 }
                 pending = None
 
@@ -475,9 +493,9 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
                     and ema_fast_v < ema_slow_v and close < float(row["open"])
                 )
                 if long_signal:
-                    pending = {"side": "LONG", "atr": float(row["atr"]), "time": stamp}
+                    pending = {"side": "LONG", "time": stamp}
                 elif short_signal:
-                    pending = {"side": "SHORT", "atr": float(row["atr"]), "time": stamp}
+                    pending = {"side": "SHORT", "time": stamp}
 
         sessions.append({"Session": str(session_key), "Trades": len(trades) - session_trades_start, "Net P&L ₹": round(daily_net, 2)})
 
@@ -495,7 +513,7 @@ if uploaded_csv is not None:
                 bt_min_spread = st.slider("Backtest Min EMA Spread", min_value=1.0, max_value=10.0, value=3.0, key="bt_spread")
             
             if st.button("▶️ Run Momentum Backtest", type="primary", key="run_bt"):
-                res_df, sess_df, m_dd = _run_expert_backtest(raw_bt, bt_qty, 40.0, 1.0, 150000.0, 3.0, 14, 2.0, 2.0, bt_min_spread, cutoff_hour, cutoff_minute)
+                res_df, sess_df, m_dd = _run_expert_backtest(raw_bt, bt_qty, 40.0, 1.0, 150000.0, 3.0, 14, bt_min_spread, cutoff_hour, cutoff_minute)
                 if not res_df.empty:
                     st.metric("Total Net P&L", f"₹{res_df['Net P&L ₹'].sum():,.2f}")
                     st.metric("Total Trades Taken", len(res_df))
@@ -504,3 +522,4 @@ if uploaded_csv is not None:
                     st.info("No trades executed. Adjust the EMA spread filter if needed.")
     except Exception as e:
         st.error(f"Error: {e}")
+.
