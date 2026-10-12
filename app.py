@@ -38,7 +38,7 @@ for k, v in defaults.items():
         st.session_state[k] = v
 
 st.title("📈 NIFTY Expert Momentum & Profit-Lock Lab")
-st.caption("EXPERT MODE • Auto Profit Lock at ₹400 & Instant Re-Entry (SL: 1.5 pts, Target: 6 pts)")
+st.caption("EXPERT MODE • Initial SL: 5 pts • Auto Profit-Lock at ₹400 (SL shifts to +1.5 pts profit, Target: 6 pts)")
 
 speed = st.select_slider(
     "⚡ Fast play speed",
@@ -56,12 +56,10 @@ with st.expander("⚙️ Expert Strategy & Risk Settings", expanded=True):
     st.markdown("---")
     st.subheader("🛡️ Momentum & Noise Filters")
     min_ema_spread = st.slider("Min EMA Separation Filter (Points)", min_value=1.0, max_value=15.0, value=3.0, step=0.5)
-    atr_stop_multiplier = st.slider("ATR Stop Buffer Multiplier", min_value=1.5, max_value=3.0, value=2.0, step=0.25)
     cutoff_hour = st.slider("Session Trade Cutoff Hour", min_value=13, max_value=15, value=14, step=1)
     cutoff_minute = st.slider("Session Trade Cutoff Minute", min_value=0, max_value=45, value=30, step=15)
     
     st.markdown("---")
-    trail_on = st.checkbox("Use trailing stop", value=True)
     auto_execute = st.checkbox("Automatic paper execution on confirmed signal", value=True)
     lot_size = 75
     base_premium = st.number_input("Starting simulated option premium (₹)", min_value=20.0, max_value=500.0, value=120.0, step=5.0)
@@ -222,41 +220,17 @@ def process_tick():
         pos["premium"] = max(1.0, pos["premium"] + option_move)
         pos["last_underlying"] = s["price"]
         
-        if trail_on and pos["premium"] > pos["best_premium"]:
-            pos["best_premium"] = pos["premium"]
-            pos["stop_premium"] = max(pos["stop_premium"], pos["best_premium"] - pos["risk_per_unit"])
-            
         pos["unrealized"] = (pos["premium"] - pos["entry_premium"]) * pos["quantity"] - pos["cost_estimate"]
         
-        # Rule: When profit exceeds 400, close that position and execute another same transaction with SL 1.5 lower and target 6 points higher
-        if pos["unrealized"] >= 400.0:
-            side_to_reenter = pos["side"]
-            exit_prem = pos["premium"]
-            close_position("Profit target exceeded ₹400 (Auto-lock & Re-entry)", exit_prem)
-            
-            new_entry = max(1.0, exit_prem)
-            new_stop = max(1.0, new_entry - 1.5)
-            new_target = new_entry + 6.0
-            s["position"] = {
-                "side": side_to_reenter,
-                "entry_time": s["sim_time"].strftime("%H:%M:%S"),
-                "entry_underlying": s["price"],
-                "last_underlying": s["price"],
-                "entry_premium": new_entry,
-                "premium": new_entry,
-                "quantity": lot_size,
-                "stop_premium": new_stop,
-                "initial_stop": new_stop,
-                "target_premium": new_target,
-                "risk_per_unit": 1.5,
-                "best_premium": new_entry,
-                "cost_estimate": costs_per_trade,
-                "unrealized": -costs_per_trade,
-            }
-            s["trade_count"] += 1
-            
-        elif pos["premium"] <= pos["stop_premium"]:
-            close_position("Stop-loss / trailing stop", pos["premium"])
+        # PROFIT LOCK LOGIC: When profit exceeds ₹400, lock profit by moving SL to +1.5 points in profit and target to 6 points
+        if pos["unrealized"] >= 400.0 and not pos.get("profit_locked", False):
+            pos["profit_locked"] = True
+            pos["stop_premium"] = pos["entry_premium"] + 1.5  # Locked 1.5 points in profit!
+            pos["target_premium"] = pos["entry_premium"] + 6.0 # Extended target to 6 points
+
+        if pos["premium"] <= pos["stop_premium"]:
+            reason = "Profit Locked Stop-Loss hit (+1.5 pts)" if pos.get("profit_locked", False) else "Initial Stop-Loss hit (5 pts)"
+            close_position(reason, pos["premium"])
         elif pos["premium"] >= pos["target_premium"]:
             close_position("Target hit", pos["premium"])
 
@@ -273,30 +247,28 @@ def process_tick():
         halted = s["daily_pnl"] <= -daily_limit
         if (auto_execute and not halted and s["position"] is None and signal in ("BUY CALL", "BUY PUT")
                 and s["bar_index"] - s["last_trade_bar"] >= 2):
-            stop_distance = 1.5
-            risk_amount_per_lot = stop_distance * lot_size
-            if risk_amount_per_lot <= risk_budget and capital >= base_premium * lot_size:
-                entry = max(1.0, base_premium + np.random.normal(0, 3))
-                stop = max(1.0, entry - 1.5)
-                target = entry + 6.0
-                s["position"] = {
-                    "side": "CALL" if signal == "BUY CALL" else "PUT",
-                    "entry_time": s["sim_time"].strftime("%H:%M:%S"),
-                    "entry_underlying": s["price"],
-                    "last_underlying": s["price"],
-                    "entry_premium": entry,
-                    "premium": entry,
-                    "quantity": lot_size,
-                    "stop_premium": stop,
-                    "initial_stop": stop,
-                    "target_premium": target,
-                    "risk_per_unit": 1.5,
-                    "best_premium": entry,
-                    "cost_estimate": costs_per_trade,
-                    "unrealized": -costs_per_trade,
-                }
-                s["trade_count"] += 1
-                s["last_trade_bar"] = s["bar_index"]
+            entry = max(1.0, base_premium + np.random.normal(0, 3))
+            stop = max(1.0, entry - 5.0)  # Initial stop-loss is 5 points below entry
+            target = entry + 6.0            # Target is 6 points
+            s["position"] = {
+                "side": "CALL" if signal == "BUY CALL" else "PUT",
+                "entry_time": s["sim_time"].strftime("%H:%M:%S"),
+                "entry_underlying": s["price"],
+                "last_underlying": s["price"],
+                "entry_premium": entry,
+                "premium": entry,
+                "quantity": lot_size,
+                "stop_premium": stop,
+                "initial_stop": stop,
+                "target_premium": target,
+                "risk_per_unit": 5.0,
+                "best_premium": entry,
+                "cost_estimate": costs_per_trade,
+                "unrealized": -costs_per_trade,
+                "profit_locked": False,
+            }
+            s["trade_count"] += 1
+            s["last_trade_bar"] = s["bar_index"]
 
 if st.session_state.running:
     st_autorefresh(interval=1000, key="simulator_tick")
@@ -361,7 +333,7 @@ if pos:
     
     p4, p5, p6 = st.columns(3)
     p4.metric("Running P&L", f'₹{current_pnl:.2f}', delta=f'₹{current_pnl:.2f}')
-    p5.metric("Stop-loss", f'₹{pos["stop_premium"]:.2f}')
+    p5.metric("Stop-loss", f'₹{pos["stop_premium"]:.2f} ({"LOCKED +1.5" if pos.get("profit_locked") else "Initial 5 pt"})')
     p6.metric("Target", f'₹{pos["target_premium"]:.2f}')
 else:
     st.info("No open position.")
@@ -374,7 +346,7 @@ if s["closed_trades"]:
     st.dataframe(pd.DataFrame(s["closed_trades"]), use_container_width=True, hide_index=True)
 
 st.divider()
-st.subheader("3. Historical Backtest Lab (Profit-Lock & Re-Entry Enabled)")
+st.subheader("3. Historical Backtest Lab (Profit-Lock Enabled)")
 uploaded_csv = st.file_uploader("Upload historical candles (CSV)", type=["csv"], key="backtest_csv")
 
 def _normalise_columns(frame):
@@ -433,25 +405,30 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
 
             if pending is not None and active is None:
                 entry = float(row["open"]) + (slippage_points if pending["side"] == "LONG" else -slippage_points)
-                stop_distance = 1.5
-                target_distance = 6.0
                 active = {
                     "side": pending["side"], "entry": entry, "entry_time": pending["time"],
-                    "stop": entry - stop_distance if pending["side"] == "LONG" else entry + stop_distance,
-                    "target": entry + target_distance if pending["side"] == "LONG" else entry - target_distance,
+                    "stop": entry - 5.0 if pending["side"] == "LONG" else entry + 5.0,
+                    "target": entry + 6.0 if pending["side"] == "LONG" else entry - 6.0,
+                    "profit_locked": False
                 }
                 pending = None
 
             if active is not None:
+                # Check profit lock condition in backtest (rough proxy via high/low or close)
+                current_profit_pts = (float(row["close"]) - active["entry"]) if active["side"] == "LONG" else (active["entry"] - float(row["close"]))
+                if current_profit_pts * int(qty) >= 400.0 and not active["profit_locked"]:
+                    active["profit_locked"] = True
+                    active["stop"] = active["entry"] + 1.5 if active["side"] == "LONG" else active["entry"] - 1.5
+
                 exit_price, exit_reason = None, None
                 if active["side"] == "LONG":
                     if float(row["low"]) <= active["stop"]:
-                        exit_price, exit_reason = active["stop"] - slippage_points, "Stop-loss"
+                        exit_price, exit_reason = active["stop"] - slippage_points, "Stop-loss (Locked)" if active["profit_locked"] else "Stop-loss (5 pt)"
                     elif float(row["high"]) >= active["target"]:
                         exit_price, exit_reason = active["target"] - slippage_points, "Target"
                 else:
                     if float(row["high"]) >= active["stop"]:
-                        exit_price, exit_reason = active["stop"] + slippage_points, "Stop-loss"
+                        exit_price, exit_reason = active["stop"] + slippage_points, "Stop-loss (Locked)" if active["profit_locked"] else "Stop-loss (5 pt)"
                     elif float(row["low"]) <= active["target"]:
                         exit_price, exit_reason = active["target"] + slippage_points, "Target"
 
