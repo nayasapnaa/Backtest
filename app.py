@@ -32,6 +32,10 @@ defaults = {
     "bar_index": 0,
     "day_id": 1,
     "history": [],
+    "warmup_bars": 6,
+    "min_ema_spread": 2.0,
+    "rvol_threshold": 1.5,
+    "max_trades_session": 5,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -51,13 +55,13 @@ with st.expander("⚙️ Institutional Strategy & Risk Settings", expanded=True)
     capital = st.number_input("Practice capital (₹)", min_value=10000, max_value=250000, value=50000, step=5000)
     risk_pct = st.select_slider("Risk budget per trade (%)", options=[1.0, 1.5, 2.0], value=1.5)
     daily_loss_pct = st.select_slider("Daily loss limit (%)", options=[1.0, 1.5, 2.0, 3.0, 5.0], value=3.0)
-    max_trades_session = 5
+    st.session_state["max_trades_session"] = 5
     
     st.markdown("---")
     st.subheader("🛡️ Institutional Filters (HTF Trend & RVOL)")
-    min_ema_spread = st.slider("Min EMA Separation Filter", min_value=1.0, max_value=10.0, value=2.0, step=0.5)
-    rvol_threshold = st.slider("Min Relative Volume (RVOL) Spike Multiplier", min_value=1.0, max_value=3.0, value=1.5, step=0.1)
-    warmup_bars = st.slider("Warm-up Bars Lock", min_value=3, max_value=15, value=6, step=1)
+    st.session_state["min_ema_spread"] = st.slider("Min EMA Separation Filter", min_value=1.0, max_value=10.0, value=2.0, step=0.5)
+    st.session_state["rvol_threshold"] = st.slider("Min Relative Volume (RVOL) Spike Multiplier", min_value=1.0, max_value=3.0, value=1.5, step=0.1)
+    st.session_state["warmup_bars"] = st.slider("Warm-up Bars Lock", min_value=3, max_value=15, value=6, step=1)
     cutoff_hour = 15
     cutoff_minute = 0
     
@@ -103,11 +107,7 @@ def calculate_institutional_indicators(candles):
     
     df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
-    
-    # Higher Timeframe Macro Bias Proxy (Longer EMA span on cumulative series)
     df["macro_trend"] = df["close"].ewm(span=50, adjust=False).mean()
-    
-    # Volume moving average for RVOL calculation
     df["vol_ma"] = df["volume"].rolling(5, min_periods=1).mean()
     df["rvol"] = df["volume"] / df["vol_ma"].replace(0, 1)
     
@@ -130,16 +130,18 @@ def calculate_institutional_indicators(candles):
 
 def signal_for_state():
     s = st.session_state
-    if s["bar_index"] < warmup_bars or s["opening_high"] is None:
-        return "NO TRADE", f"Warm-up lock active (Bar {s['bar_index']}/{warm_bars}). Building institutional data."
+    w_bars = s.get("warmup_bars", 6)
+    if s["bar_index"] < w_bars or s["opening_high"] is None:
+        return "NO TRADE", f"Warm-up lock active (Bar {s['bar_index']}/{w_bars}). Building institutional data."
     
     current_t = s["sim_time"].time()
     cutoff_t = dtime(cutoff_hour, cutoff_minute)
     if current_t >= cutoff_t or current_t < dtime(9, 15):
         return "NO TRADE", "Outside active trading window."
 
-    if s["trade_count"] >= max_trades_session:
-        return "NO TRADE", f"Discipline limit reached ({max_trades_session} trades completed)."
+    max_t = s.get("max_trades_session", 5)
+    if s["trade_count"] >= max_t:
+        return "NO TRADE", f"Discipline limit reached ({max_t} trades completed)."
 
     candles = s["candles"]
     last = candles[-1]
@@ -149,19 +151,21 @@ def signal_for_state():
         return "NO TRADE", "Initializing indicators..."
 
     ema_spread = abs(ema_fast - ema_slow)
-    if ema_spread < min_ema_spread:
+    min_spread = s.get("min_ema_spread", 2.0)
+    if ema_spread < min_spread:
         return "NO TRADE", f"EMA spread compressed ({ema_spread:.1f}). Awaiting momentum expansion."
 
-    # RVOL filter check
-    if rvol < rvol_threshold:
-        return "NO TRADE", f"Low volume profile (RVOL {rvol:.2f} < {rvol_threshold}). Rejecting low-conviction move."
+    rvol_thresh = s.get("rvol_threshold", 1.5)
+    if rvol < rvol_thresh:
+        return "NO TRADE", f"Low volume profile (RVOL {rvol:.2f} < {rvol_thresh}). Rejecting low-conviction move."
 
-    body = abs(last["close"] - last["open"])
     total_range = last["high"] - last["low"]
+    if total_range == 0:
+        return "NO TRADE", "Zero range candle."
+        
     lower_wick = min(last["close"], last["open"]) - last["low"]
     upper_wick = last["high"] - max(last["close"], last["open"])
 
-    # Macro Trend Bias check
     macro_bullish = last["close"] > macro_trend
     macro_bearish = last["close"] < macro_trend
 
@@ -253,7 +257,6 @@ def process_tick():
         
         pos["unrealized"] = (pos["premium"] - pos["entry_premium"]) * pos["quantity"] - pos["cost_estimate"]
         
-        # Profit Lock Rule: After hitting >= ₹500 profit, lock stoploss at Entry + 5 points
         if pos["unrealized"] >= 500.0 and not pos.get("profit_locked", False):
             pos["profit_locked"] = True
             pos["stop_premium"] = pos["entry_premium"] + 5.0
@@ -279,7 +282,9 @@ def process_tick():
         signal, reason = signal_for_state()
         s["last_signal"], s["last_reason"] = signal, reason
 
-        halted = s["daily_pnl"] <= -daily_limit or s["trade_count"] >= max_trades_session or s["bar_index"] < warmup_bars
+        max_t = s.get("max_trades_session", 5)
+        w_bars = s.get("warmup_bars", 6)
+        halted = s["daily_pnl"] <= -daily_limit or s["trade_count"] >= max_t or s["bar_index"] < w_bars
         if (auto_execute and not halted and s["position"] is None and signal in ("BUY CALL", "BUY PUT")
                 and s["bar_index"] - s["last_trade_bar"] >= 3):
             entry = max(1.0, base_premium + np.random.normal(0, 2))
@@ -328,7 +333,8 @@ m1, m2, m3, m4 = st.columns(4)
 m1.metric("Simulated NIFTY", f'{s["price"]:,.2f}', f'{s["price"]-s["prev_close"]:+.2f}')
 m2.metric("VWAP", f'{vwap:,.2f}' if vwap else "—")
 m3.metric("RVOL Spike", f'{rvol:.2f}x' if rvol else "—")
-m4.metric("Trades Today", f'{s["trade_count"]}/{max_trades_session}')
+max_t = s.get("max_trades_session", 5)
+m4.metric("Trades Today", f'{s["trade_count"]}/{max_t}')
 
 if s["opening_high"] is not None:
     st.write(f'**Opening Range:** {s["opening_low"]:,.2f} – {s["opening_high"]:,.2f}')
@@ -375,7 +381,7 @@ else:
 
 r1, r2 = st.columns(2)
 r1.metric("Closed Session P&L", f'₹{s["daily_pnl"]:.2f}')
-r2.metric("Total Trades Executed", f'{s["trade_count"]}/{max_trades_session}')
+r2.metric("Total Trades Executed", f'{s["trade_count"]}/{max_t}')
 
 if s["closed_trades"]:
     st.dataframe(pd.DataFrame(s["closed_trades"]), use_container_width=True, hide_index=True)
