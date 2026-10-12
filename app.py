@@ -27,7 +27,7 @@ defaults = {
     "consecutive_losses": 0,
     "daily_pnl": 0.0,
     "last_signal": "NO TRADE",
-    "last_reason": "Waiting for high-probability retest setup.",
+    "last_reason": "Waiting for clean trend momentum.",
     "last_trade_bar": -999,
     "bar_index": 0,
     "day_id": 1,
@@ -37,8 +37,8 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-st.title("📈 NIFTY Expert Retest & Rejection Quant Lab")
-st.caption("EXPERT MODE • Pullback Retest Logic • Fakeout Filter • VWAP & EMA Alignment")
+st.title("📈 NIFTY Expert Momentum & Trend Quant Lab")
+st.caption("EXPERT MODE • Clean EMA Cross & VWAP Momentum • Optimized Stop-Loss Buffers")
 
 speed = st.select_slider(
     "⚡ Fast play speed",
@@ -51,12 +51,12 @@ with st.expander("⚙️ Expert Strategy & Risk Settings", expanded=True):
     capital = st.number_input("Practice capital (₹)", min_value=10000, max_value=250000, value=50000, step=5000)
     risk_pct = st.select_slider("Risk budget per trade (%)", options=[1.0, 1.5, 2.0], value=1.5)
     daily_loss_pct = st.select_slider("Daily loss limit (%)", options=[1.0, 1.5, 2.0, 3.0, 5.0], value=3.0)
-    target_r = st.select_slider("Target (R multiple)", options=[2.0, 2.5, 3.0, 3.5], value=2.5)
+    target_r = st.select_slider("Target (R multiple)", options=[1.5, 2.0, 2.5, 3.0], value=2.0)
     
     st.markdown("---")
-    st.subheader("🛡️ Professional False-Breakout Defense")
-    use_retest_filter = st.checkbox("Require Pullback & Retest Confirmation (Stops fakeouts)", value=True)
-    adx_threshold = st.slider("Minimum ADX Trend Strength", min_value=15, max_value=35, value=22, step=1)
+    st.subheader("🛡️ Momentum & Noise Filters")
+    min_ema_spread = st.slider("Min EMA Separation Filter (Points)", min_value=1.0, max_value=15.0, value=3.0, step=0.5)
+    atr_stop_multiplier = st.slider("ATR Stop Buffer Multiplier", min_value=1.5, max_value=3.0, value=2.0, step=0.25)
     cutoff_hour = st.slider("Session Trade Cutoff Hour", min_value=13, max_value=15, value=14, step=1)
     cutoff_minute = st.slider("Session Trade Cutoff Minute", min_value=0, max_value=45, value=30, step=15)
     
@@ -105,29 +105,20 @@ def calculate_expert_indicators(candles):
     df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
     
     period = 14
-    df['tr'] = pd.concat([
-        df['high'] - df['low'],
-        (df['high'] - df['close'].shift(1)).abs(),
-        (df['low'] - df['close'].shift(1)).abs()
+    previous_close = df["close"].shift(1)
+    true_range = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - previous_close).abs(),
+        (df["low"] - previous_close).abs()
     ], axis=1).max(axis=1)
-    df['up_move'] = df['high'] - df['high'].shift(1)
-    df['down_move'] = df['low'].shift(1) - df['low']
-    df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0.0)
-    df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0.0)
+    df['atr'] = true_range.rolling(period, min_periods=1).mean()
     
-    tr_smooth = df['tr'].ewm(alpha=1/period, adjust=False).mean()
-    plus_di = 100 * (df['plus_dm'].ewm(alpha=1/period, adjust=False).mean() / tr_smooth.replace(0, np.nan))
-    minus_di = 100 * (df['minus_dm'].ewm(alpha=1/period, adjust=False).mean() / tr_smooth.replace(0, np.nan))
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    df['adx'] = dx.ewm(alpha=1/period, adjust=False).mean()
-    
-    current_adx = float(df['adx'].iloc[-1]) if not pd.isna(df['adx'].iloc[-1]) else 15.0
-    return vwap, float(df["ema_fast"].iloc[-1]), float(df["ema_slow"].iloc[-1]), current_adx
+    return vwap, float(df["ema_fast"].iloc[-1]), float(df["ema_slow"].iloc[-1]), float(df['atr'].iloc[-1])
 
 def signal_for_state():
     s = st.session_state
-    if s["bar_index"] < 5 or s["opening_high"] is None:
-        return "NO TRADE", "Waiting for opening range and structure establishment."
+    if s["bar_index"] < 3 or s["opening_high"] is None:
+        return "NO TRADE", "Waiting for opening range completion."
     
     current_t = s["sim_time"].time()
     cutoff_t = dtime(cutoff_hour, cutoff_minute)
@@ -136,46 +127,38 @@ def signal_for_state():
 
     candles = s["candles"]
     last = candles[-1]
-    prev = candles[-2]
-    vwap, ema_fast, ema_slow, adx = calculate_expert_indicators(candles)
+    vwap, ema_fast, ema_slow, atr = calculate_expert_indicators(candles)
     
     if vwap is None:
         return "NO TRADE", "Gathering price data..."
 
-    if adx < adx_threshold:
-        return f"SIDEWAYS / CHOP (ADX: {adx:.1f})", f"Weak trend strength (ADX {adx:.1f} < {adx_threshold}). Standing aside to prevent whipsaws."
+    ema_spread = abs(ema_fast - ema_slow)
+    if ema_spread < min_ema_spread:
+        return "NO TRADE", f"EMA spread too tight ({ema_spread:.1f} < {min_ema_spread}). Market lacks clean directional momentum."
 
-    # Retest Logic: Price broke opening high earlier, pulled back toward opening high or VWAP, and is now bouncing bullishly.
-    recent_highs = max(c["high"] for c in candles[-5:-1])
-    recent_lows = min(c["low"] for c in candles[-5:-1])
-
-    bullish_retest = (
-        recent_highs >= s["opening_high"] 
-        and last["low"] <= s["opening_high"] + 10  # Tested near or inside opening high
-        and last["close"] > last["open"]           # Bullish rejection candle
+    # Clean Momentum Breakout with Proper EMA separation and VWAP alignment
+    bullish = (
+        last["close"] > s["opening_high"] 
         and last["close"] > vwap 
-        and ema_fast > ema_slow
+        and ema_fast > ema_slow 
+        and (ema_fast - ema_slow) >= min_ema_spread
+        and last["close"] > last["open"]
     )
 
-    bearish_retest = (
-        recent_lows <= s["opening_low"] 
-        and last["high"] >= s["opening_low"] - 10  # Tested near or inside opening low
-        and last["close"] < last["open"]           # Bearish rejection candle
+    bearish = (
+        last["close"] < s["opening_low"] 
         and last["close"] < vwap 
-        and ema_fast < ema_slow
+        and ema_fast < ema_slow 
+        and (ema_slow - ema_fast) >= min_ema_spread
+        and last["close"] < last["open"]
     )
 
-    if not use_retest_filter:
-        # Fallback to standard momentum if retest filter disabled
-        bullish_retest = last["close"] > s["opening_high"] and last["close"] > vwap and ema_fast > ema_slow
-        bearish_retest = last["close"] < s["opening_low"] and last["close"] < vwap and ema_fast < ema_slow
-
-    if bullish_retest:
-        return "BUY CALL", f"Expert Retest Confirmed: Pullback to support held with VWAP & EMA alignment (ADX {adx:.1f})."
-    if bearish_retest:
-        return "BUY PUT", f"Expert Retest Confirmed: Pullback to resistance rejected with VWAP & EMA alignment (ADX {adx:.1f} )."
+    if bullish:
+        return "BUY CALL", f"Strong Bullish Momentum: Clean breakout with EMA spread {ema_spread:.1f}."
+    if bearish:
+        return "BUY PUT", f"Strong Bearish Momentum: Clean breakdown with EMA spread {ema_spread:.1f}."
         
-    return "NO TRADE", f"Waiting for clean retest & rejection setup (ADX: {adx:.1f})."
+    return "NO TRADE", "Waiting for clear momentum expansion."
 
 def close_position(reason, exit_premium):
     s = st.session_state
@@ -262,8 +245,8 @@ def process_tick():
 
         halted = s["daily_pnl"] <= -daily_limit
         if (auto_execute and not halted and s["position"] is None and signal in ("BUY CALL", "BUY PUT")
-                and s["bar_index"] - s["last_trade_bar"] >= 3):
-            stop_distance = min(max(1.0, base_premium * 0.12), risk_budget / lot_size)
+                and s["bar_index"] - s["last_trade_bar"] >= 2):
+            stop_distance = min(max(1.0, base_premium * 0.15), risk_budget / lot_size)
             risk_amount_per_lot = stop_distance * lot_size
             if risk_amount_per_lot <= risk_budget and capital >= base_premium * lot_size:
                 entry = max(1.0, base_premium + np.random.normal(0, 3))
@@ -298,7 +281,7 @@ if st.session_state.running:
             break
 
 s = st.session_state
-vwap, ema_fast, ema_slow, current_adx = calculate_expert_indicators(s["candles"])
+vwap, ema_fast, ema_slow, atr = calculate_expert_indicators(s["candles"])
 signal, reason = signal_for_state() if s["bar_index"] > 0 else (s["last_signal"], s["last_reason"])
 
 if s["position"]:
@@ -310,7 +293,7 @@ st.subheader("1. Live Expert Simulator Dashboard")
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Simulated NIFTY", f'{s["price"]:,.2f}', f'{s["price"]-s["prev_close"]:+.2f}')
 m2.metric("VWAP", f'{vwap:,.2f}' if vwap else "—")
-m3.metric("ADX Trend Strength", f'{current_adx:.1f}' if current_adx else "—")
+m3.metric("EMA Spread", f'{abs(ema_fast - ema_slow):.1f}' if ema_fast else "—")
 m4.metric("Candle timer", f'{s["candle_seconds"] - s["ticks_in_candle"]:02d}s')
 
 if s["opening_high"] is not None:
@@ -319,15 +302,13 @@ else:
     st.write("**Opening Range:** Waiting for opening range establishment.")
 
 if display_signal == "BUY CALL":
-    st.success("🟢 BUY CALL — Retest & Rejection Verified")
+    st.success("🟢 BUY CALL — Momentum Breakout Confirmed")
 elif display_signal == "BUY PUT":
-    st.error("🔴 BUY PUT — Retest & Rejection Verified")
-elif "SIDEWAYS" in display_signal:
-    st.warning(f"🛡️ {display_signal}")
+    st.error("🔴 BUY PUT — Momentum Breakdown Confirmed")
 elif display_signal.startswith("POSITION OPEN"):
     st.info(f"📍 {display_signal}")
 else:
-    st.warning("⏸ PATIENTLY WAITING FOR RETEST SETUP")
+    st.warning("⏸ WAITING FOR CLEAN MOMENTUM")
 st.write(s["last_reason"])
 
 if s["candles"]:
@@ -356,7 +337,7 @@ if pos:
     p5.metric("Stop-loss", f'₹{pos["stop_premium"]:.2f}')
     p6.metric("Target", f'₹{pos["target_premium"]:.2f}')
 else:
-    st.info("No open position. Waiting for valid retest confirmation.")
+    st.info("No open position.")
 
 r1, r2 = st.columns(2)
 r1.metric("Closed Session P&L", f'₹{s["daily_pnl"]:.2f}')
@@ -366,7 +347,7 @@ if s["closed_trades"]:
     st.dataframe(pd.DataFrame(s["closed_trades"]), use_container_width=True, hide_index=True)
 
 st.divider()
-st.subheader("3. Historical Backtest Lab (Retest Logic Enabled)")
+st.subheader("3. Historical Backtest Lab (Momentum & Spread Filter)")
 uploaded_csv = st.file_uploader("Upload historical candles (CSV)", type=["csv"], key="backtest_csv")
 
 def _normalise_columns(frame):
@@ -383,7 +364,7 @@ def _normalise_columns(frame):
 
 def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
                          capital_value, daily_loss_pct_value,
-                         atr_period, atr_stop_mult, target_r, min_adx, cut_h, cut_m):
+                         atr_period, atr_stop_mult, target_r, min_spread, cut_h, cut_m):
     data = frame.copy()
     data["session"] = data["time"].dt.date if "time" in data.columns else "single_session"
     data = data.sort_values("time").reset_index(drop=True) if "time" in data.columns else data.reset_index(drop=True)
@@ -396,7 +377,7 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
 
     for session_key, day in data.groupby("session", sort=False):
         day = day.copy().reset_index(drop=True)
-        if len(day) < max(atr_period + 5, 20):
+        if len(day) < max(atr_period + 3, 15):
             continue
 
         typical = (day["high"] + day["low"] + day["close"]) / 3.0
@@ -413,19 +394,7 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
             (day["high"] - previous_close).abs(),
             (day["low"] - previous_close).abs()
         ], axis=1).max(axis=1)
-        day["atr"] = true_range.rolling(atr_period, min_periods=atr_period).mean()
-
-        p = 14
-        df_tr = true_range
-        up_move = day["high"] - day["high"].shift(1)
-        down_move = day["low"].shift(1) - day["low"]
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-        tr_smooth = pd.Series(df_tr).ewm(alpha=1/p, adjust=False).mean()
-        plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=1/p, adjust=False).mean() / tr_smooth.replace(0, np.nan))
-        minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=1/p, adjust=False).mean() / tr_smooth.replace(0, np.nan))
-        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-        day["adx"] = dx.ewm(alpha=1/p, adjust=False).mean()
+        day["atr"] = true_range.rolling(atr_period, min_periods=1).mean()
 
         opening_high = float(day.loc[:2, "high"].max())
         opening_low = float(day.loc[:2, "low"].min())
@@ -434,7 +403,7 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
         daily_net = 0.0
         session_trades_start = len(trades)
 
-        for i in range(5, len(day)):
+        for i in range(3, len(day)):
             row = day.iloc[i]
             exited_this_bar = False
             stamp = str(row["time"]) if "time" in day.columns else f"{session_key} candle {i+1}"
@@ -491,31 +460,24 @@ def _run_expert_backtest(frame, qty, cost_per_trade, slippage_points,
                 pending = None
                 continue
 
-            adx_val = row["adx"]
-            if active is None and pending is None and not exited_this_bar and pd.notna(adx_val):
-                if float(adx_val) >= min_adx:
-                    recent_highs = day.loc[i-4:i-1, "high"].max()
-                    recent_lows = day.loc[i-4:i-1, "low"].min()
-                    
-                    long_retest = (
-                        recent_highs >= opening_high
-                        and float(row["low"]) <= opening_high + 10
-                        and float(row["close"]) > float(row["open"])
-                        and float(row["close"]) > float(row["vwap"])
-                        and float(row["ema_fast"]) > float(row["ema_slow"])
-                    )
-                    short_retest = (
-                        recent_lows <= opening_low
-                        and float(row["high"]) >= opening_low - 10
-                        and float(row["close"]) < float(row["open"])
-                        and float(row["close"]) < float(row["vwap"])
-                        and float(row["ema_fast"]) < float(row["ema_slow"])
-                    )
+            ema_fast_v = row["ema_fast"]
+            ema_slow_v = row["ema_slow"]
+            spread = abs(ema_fast_v - ema_slow_v)
 
-                    if long_retest:
-                        pending = {"side": "LONG", "atr": float(row["atr"]), "time": stamp}
-                    elif short_retest:
-                        pending = {"side": "SHORT", "atr": float(row["atr"]), "time": stamp}
+            if active is None and pending is None and not exited_this_bar and spread >= min_spread:
+                close = float(row["close"])
+                long_signal = (
+                    close > opening_high and close > float(row["vwap"])
+                    and ema_fast_v > ema_slow_v and close > float(row["open"])
+                )
+                short_signal = (
+                    close < opening_low and close < float(row["vwap"])
+                    and ema_fast_v < ema_slow_v and close < float(row["open"])
+                )
+                if long_signal:
+                    pending = {"side": "LONG", "atr": float(row["atr"]), "time": stamp}
+                elif short_signal:
+                    pending = {"side": "SHORT", "atr": float(row["atr"]), "time": stamp}
 
         sessions.append({"Session": str(session_key), "Trades": len(trades) - session_trades_start, "Net P&L ₹": round(daily_net, 2)})
 
@@ -530,15 +492,15 @@ if uploaded_csv is not None:
             
             with st.expander("Backtest Parameters", expanded=True):
                 bt_qty = st.number_input("Backtest Quantity", value=75, key="bt_q")
-                bt_min_adx = st.slider("Backtest Min ADX Filter", min_value=15, max_value=30, value=22, key="bt_adx")
+                bt_min_spread = st.slider("Backtest Min EMA Spread", min_value=1.0, max_value=10.0, value=3.0, key="bt_spread")
             
-            if st.button("▶️ Run Retest Backtest", type="primary", key="run_bt"):
-                res_df, sess_df, m_dd = _run_expert_backtest(raw_bt, bt_qty, 40.0, 1.0, 150000.0, 3.0, 14, 1.5, 2.5, bt_min_adx, cutoff_hour, cutoff_minute)
+            if st.button("▶️ Run Momentum Backtest", type="primary", key="run_bt"):
+                res_df, sess_df, m_dd = _run_expert_backtest(raw_bt, bt_qty, 40.0, 1.0, 150000.0, 3.0, 14, 2.0, 2.0, bt_min_spread, cutoff_hour, cutoff_minute)
                 if not res_df.empty:
                     st.metric("Total Net P&L", f"₹{res_df['Net P&L ₹'].sum():,.2f}")
                     st.metric("Total Trades Taken", len(res_df))
                     st.dataframe(res_df, use_container_width=True, hide_index=True)
                 else:
-                    st.info("No trades executed. The retest filter successfully blocked weak fakeout trades.")
+                    st.info("No trades executed. Adjust the EMA spread filter if needed.")
     except Exception as e:
         st.error(f"Error: {e}")
