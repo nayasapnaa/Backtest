@@ -1,387 +1,208 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import time
 import re
 from datetime import datetime, timedelta, time as dtime
-from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="NIFTY Institutional Quant Lab", page_icon="📈", layout="centered")
+st.set_page_config(page_title="NIFTY Real Chart Backtest Lab", page_icon="📈", layout="centered")
 
-defaults = {
-    "running": False,
-    "price": 25000.0,
-    "prev_close": 25000.0,
-    "candles": [],
-    "ticks_in_candle": 0,
-    "candle_seconds": 30,
-    "tick_seconds": 1,
-    "sim_time": datetime(2026, 10, 12, 9, 15),
-    "opening_high": None,
-    "opening_low": None,
-    "session_candles": 0,
-    "position": None,
-    "trades": [],
-    "closed_trades": [],
-    "trade_count": 0,
-    "consecutive_losses": 0,
-    "daily_pnl": 0.0,
-    "last_signal": "NO TRADE",
-    "last_reason": "Institutional filters active. Warming up.",
-    "last_trade_bar": -999,
-    "bar_index": 0,
-    "day_id": 1,
-    "history": [],
-    "warmup_bars": 6,
-    "min_ema_spread": 2.0,
-    "rvol_threshold": 1.5,
-    "max_trades_session": 5,
-}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+st.title("📈 NIFTY Real Chart Backtest Lab")
+st.caption("Upload your historical OHLCV CSV to backtest your exact Profit-Lock & Rejection strategy.")
 
-st.title("📈 NIFTY Institutional S-Tier Quant Lab")
-st.caption("S-TIER OPTIONS MODE • HTF Trend Filter • Relative Volume (RVOL) Spike Filter • Profit-Lock System")
+with st.expander("⚙️ Backtest Strategy Parameters", expanded=True):
+    bt_capital = st.number_input("Backtest Initial Capital (₹)", value=150000.0, step=10000.0)
+    bt_lot_size = st.number_input("Backtest Quantity / Lot Size", value=75, step=25)
+    bt_costs = st.number_input("Round-trip cost per batch (₹)", value=40.0, step=5.0)
+    bt_slippage = st.number_input("Estimated Slippage (Points)", value=1.0, step=0.5)
+    bt_min_spread = st.slider("Min EMA Separation Filter", min_value=1.0, max_value=10.0, value=2.0, step=0.5)
 
-speed = st.select_slider(
-    "⚡ Fast play speed",
-    options=[1, 2, 5, 10, 20, 40, 60],
-    value=1,
-    format_func=lambda x: f"{x}x"
-)
+uploaded_csv = st.file_uploader("Upload historical candles (CSV format)", type=["csv"], key="real_chart_csv")
 
-with st.expander("⚙️ Institutional Strategy & Risk Settings", expanded=True):
-    capital = st.number_input("Practice capital (₹)", min_value=10000, max_value=250000, value=50000, step=5000)
-    risk_pct = st.select_slider("Risk budget per trade (%)", options=[1.0, 1.5, 2.0], value=1.5)
-    daily_loss_pct = st.select_slider("Daily loss limit (%)", options=[1.0, 1.5, 2.0, 3.0, 5.0], value=3.0)
-    st.session_state["max_trades_session"] = 5
-    
-    st.markdown("---")
-    st.subheader("🛡️ Institutional Filters (HTF Trend & RVOL)")
-    st.session_state["min_ema_spread"] = st.slider("Min EMA Separation Filter", min_value=1.0, max_value=10.0, value=2.0, step=0.5)
-    st.session_state["rvol_threshold"] = st.slider("Min Relative Volume (RVOL) Spike Multiplier", min_value=1.0, max_value=3.0, value=1.5, step=0.1)
-    st.session_state["warmup_bars"] = st.slider("Warm-up Bars Lock", min_value=3, max_value=15, value=6, step=1)
-    cutoff_hour = 15
-    cutoff_minute = 0
-    
-    st.markdown("---")
-    auto_execute = st.checkbox("Automatic paper execution on confirmed signal", value=True)
-    lot_size = 75
-    base_premium = st.number_input("Starting simulated option premium (₹)", min_value=20.0, max_value=500.0, value=120.0, step=5.0)
-    premium_sensitivity = st.slider("Option premium sensitivity", min_value=0.5, max_value=3.0, value=1.2, step=0.1)
-    costs_per_trade = st.number_input("Estimated round-trip cost per batch (₹)", min_value=0.0, max_value=200.0, value=20.0, step=5.0)
-
-risk_budget = capital * risk_pct / 100
-daily_limit = capital * daily_loss_pct / 100
-
-c1, c2 = st.columns(2)
-with c1:
-    if st.button("▶️ Start / Resume", use_container_width=True, type="primary"):
-        st.session_state.running = True
-with c2:
-    if st.button("⏸ Pause", use_container_width=True):
-        st.session_state.running = False
-
-c3, c4 = st.columns(2)
-with c3:
-    if st.button("🔄 Reset session", use_container_width=True):
-        for k, v in defaults.items():
-            st.session_state[k] = v
-        st.rerun()
-with c4:
-    if st.button("⏭ Next candle", use_container_width=True):
-        st.session_state.ticks_in_candle = st.session_state.candle_seconds - 1
-        st.session_state.running = False
-
-def calculate_institutional_indicators(candles):
-    if not candles or len(candles) < 8:
-        return None, None, None, None, None
-    df = pd.DataFrame(candles)
-    vol = df["volume"].sum()
-    if vol <= 0:
-        vwap = float(df["close"].mean())
-    else:
-        typical = (df["high"] + df["low"] + df["close"]) / 3
-        vwap = float((typical * df["volume"]).sum() / vol)
-    
-    df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
-    df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
-    df["macro_trend"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["vol_ma"] = df["volume"].rolling(5, min_periods=1).mean()
-    df["rvol"] = df["volume"] / df["vol_ma"].replace(0, 1)
-    
-    period = 14
-    previous_close = df["close"].shift(1)
-    true_range = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - previous_close).abs(),
-        (df["low"] - previous_close).abs()
-    ], axis=1).max(axis=1)
-    df['atr'] = true_range.rolling(period, min_periods=1).mean()
-    
-    return (
-        vwap, 
-        float(df["ema_fast"].iloc[-1]), 
-        float(df["ema_slow"].iloc[-1]), 
-        float(df["macro_trend"].iloc[-1]), 
-        float(df["rvol"].iloc[-1])
-    )
-
-def signal_for_state():
-    s = st.session_state
-    w_bars = s.get("warmup_bars", 6)
-    if s["bar_index"] < w_bars or s["opening_high"] is None:
-        return "NO TRADE", f"Warm-up lock active (Bar {s['bar_index']}/{w_bars}). Building institutional data."
-    
-    current_t = s["sim_time"].time()
-    cutoff_t = dtime(cutoff_hour, cutoff_minute)
-    if current_t >= cutoff_t or current_t < dtime(9, 15):
-        return "NO TRADE", "Outside active trading window."
-
-    max_t = s.get("max_trades_session", 5)
-    if s["trade_count"] >= max_t:
-        return "NO TRADE", f"Discipline limit reached ({max_t} trades completed)."
-
-    candles = s["candles"]
-    last = candles[-1]
-    vwap, ema_fast, ema_slow, macro_trend, rvol = calculate_institutional_indicators(candles)
-    
-    if vwap is None:
-        return "NO TRADE", "Initializing indicators..."
-
-    ema_spread = abs(ema_fast - ema_slow)
-    min_spread = s.get("min_ema_spread", 2.0)
-    if ema_spread < min_spread:
-        return "NO TRADE", f"EMA spread compressed ({ema_spread:.1f}). Awaiting momentum expansion."
-
-    rvol_thresh = s.get("rvol_threshold", 1.5)
-    if rvol < rvol_thresh:
-        return "NO TRADE", f"Low volume profile (RVOL {rvol:.2f} < {rvol_thresh}). Rejecting low-conviction move."
-
-    total_range = last["high"] - last["low"]
-    if total_range == 0:
-        return "NO TRADE", "Zero range candle."
-        
-    lower_wick = min(last["close"], last["open"]) - last["low"]
-    upper_wick = last["high"] - max(last["close"], last["open"])
-
-    macro_bullish = last["close"] > macro_trend
-    macro_bearish = last["close"] < macro_trend
-
-    is_bullish_rejection = (
-        lower_wick > (total_range * 0.45) 
-        and last["close"] > last["open"]
-        and (last["low"] <= vwap or last["low"] <= s["opening_high"])
-        and ema_fast > ema_slow
-        and macro_bullish
-    )
-
-    is_bearish_rejection = (
-        upper_wick > (total_range * 0.45) 
-        and last["close"] < last["open"]
-        and (last["high"] >= vwap or last["high"] >= s["opening_low"])
-        and ema_fast < ema_slow
-        and macro_bearish
-    )
-
-    if is_bullish_rejection:
-        return "BUY CALL", f"S-Tier Setup: Rejection pin bar + RVOL ({rvol:.1f}x) + HTF Bullish Bias."
-    if is_bearish_rejection:
-        return "BUY PUT", f"S-Tier Setup: Rejection pin bar + RVOL ({rvol:.1f}x) + HTF Bearish Bias."
-        
-    return "NO TRADE", "Scanning for institutional volume-backed rejections."
-
-def close_position(reason, exit_premium):
-    s = st.session_state
-    pos = s["position"]
-    if not pos:
-        return
-    gross = (exit_premium - pos["entry_premium"]) * pos["quantity"]
-    net = gross - pos["cost_estimate"]
-    trade = {
-        "Trade": len(s["closed_trades"]) + 1,
-        "Side": pos["side"],
-        "Entry time": pos["entry_time"],
-        "Exit time": s["sim_time"].strftime("%H:%M:%S"),
-        "Entry premium ₹": round(pos["entry_premium"], 2),
-        "Exit premium ₹": round(exit_premium, 2),
-        "Qty": pos["quantity"],
-        "Exit reason": reason,
-        "Gross P&L ₹": round(gross, 2),
-        "Costs ₹": round(pos["cost_estimate"], 2),
-        "Net P&L ₹": round(net, 2),
+def _normalise_columns(frame):
+    frame = frame.copy()
+    frame.columns = [
+        re.sub(r"[^a-z0-9]+", "_", str(c).strip().lower()).strip("_")
+        for c in frame.columns
+    ]
+    aliases = {
+        "datetime": "time", "timestamp": "time", "date_time": "time",
+        "date": "time", "time_stamp": "time", "vol": "volume",
     }
-    s["closed_trades"].append(trade)
-    s["daily_pnl"] += net
-    if net < 0:
-        s["consecutive_losses"] += 1
+    return frame.rename(columns={c: aliases.get(c, c) for c in frame.columns})
+
+def run_historical_backtest(frame, qty, cost_per_trade, slippage_points, min_spread):
+    data = frame.copy()
+    if "time" in data.columns:
+        data["time"] = pd.to_datetime(data["time"], errors="coerce")
+        data["session"] = data["time"].dt.date
+        data = data.sort_values("time").reset_index(drop=True)
     else:
-        s["consecutive_losses"] = 0
-    s["position"] = None
+        data["session"] = "single_session"
+        data = data.reset_index(drop=True)
 
-def process_tick():
-    s = st.session_state
-    t = s["ticks_in_candle"]
-    trend_cycle = np.sin((s["bar_index"] + t / s["candle_seconds"]) / 3.7) * 0.75
-    shock = np.sin((s["bar_index"] * 7 + t * 3) / 5.0) * 0.9
-    drift = trend_cycle + shock + np.random.normal(0, 1.25)
-    new_price = max(1000, s["price"] + drift)
-    s["prev_close"] = s["price"]
-    s["price"] = float(new_price)
-    s["sim_time"] += timedelta(seconds=1)
-    s["ticks_in_candle"] += 1
+    trades = []
+    equity = 0.0
+    peak_equity = 0.0
+    max_drawdown = 0.0
+    sessions = []
 
-    if not s["candles"] or s["ticks_in_candle"] == 1:
-        s["candles"].append({
-            "time": s["sim_time"], "open": s["prev_close"], 
-            "high": max(s["prev_close"], s["price"]),
-            "low": min(s["prev_close"], s["price"]), 
-            "close": s["price"], "volume": int(np.random.randint(50, 250))
-        })
-    else:
-        cur = s["candles"][-1]
-        cur["high"] = max(cur["high"], s["price"])
-        cur["low"] = min(cur["low"], s["price"])
-        cur["close"] = s["price"]
-        cur["volume"] += int(np.random.randint(10, 80))
+    for session_key, day in data.groupby("session", sort=False):
+        day = day.copy().reset_index(drop=True)
+        if len(day) < 15:
+            continue
 
-    if s["position"]:
-        pos = s["position"]
-        underlying_change = s["price"] - pos["last_underlying"]
-        direction = 1.0 if pos["side"] == "CALL" else -1.0
-        option_move = direction * underlying_change * 0.035 * premium_sensitivity
-        option_move += np.random.normal(0, 0.18)
-        pos["premium"] = max(1.0, pos["premium"] + option_move)
-        pos["last_underlying"] = s["price"]
+        # Calculate technical indicators for real chart
+        typical = (day["high"] + day["low"] + day["close"]) / 3.0
+        vol = day["volume"].clip(lower=0)
+        cumulative_volume = vol.cumsum()
+        day["vwap"] = ((typical * vol).cumsum() / cumulative_volume.replace(0, np.nan))
+        day["vwap"] = day["vwap"].fillna(day["close"].expanding().mean())
         
-        pos["unrealized"] = (pos["premium"] - pos["entry_premium"]) * pos["quantity"] - pos["cost_estimate"]
+        day["ema_fast"] = day["close"].ewm(span=9, adjust=False).mean()
+        day["ema_slow"] = day["close"].ewm(span=21, adjust=False).mean()
+        day["macro_trend"] = day["close"].ewm(span=50, adjust=False).mean()
         
-        if pos["unrealized"] >= 500.0 and not pos.get("profit_locked", False):
-            pos["profit_locked"] = True
-            pos["stop_premium"] = pos["entry_premium"] + 5.0
-            pos["target_premium"] = pos["entry_premium"] + 15.0
+        opening_high = float(day.loc[:2, "high"].max())
+        opening_low = float(day.loc[:2, "low"].min())
+        
+        active = None
+        pending = None
+        daily_net = 0.0
+        trades_today = 0
+        session_trades_start = len(trades)
 
-        if pos.get("profit_locked", False) and pos["premium"] > pos["best_premium"]:
-            pos["best_premium"] = pos["premium"]
-            pos["stop_premium"] = max(pos["stop_premium"], pos["best_premium"] - 2.5)
+        for i in range(4, len(day)):
+            row = day.iloc[i]
+            exited_this_bar = False
+            stamp = str(row["time"]) if "time" in day.columns else f"Candle {i+1}"
 
-        if pos["premium"] <= pos["stop_premium"]:
-            reason = "Profit-Locked Trailing SL hit (+5 pts)" if pos.get("profit_locked", False) else "Initial Stop-Loss hit (5 pts)"
-            close_position(reason, pos["premium"])
-        elif pos["premium"] >= pos["target_premium"]:
-            close_position("Target hit (10 pts)", pos["premium"])
+            # Execute pending signal on open of next candle
+            if pending is not None and active is None and trades_today < 5:
+                entry = float(row["open"]) + (slippage_points if pending["side"] == "LONG" else -slippage_points)
+                active = {
+                    "side": pending["side"], 
+                    "entry": entry, 
+                    "entry_time": pending["time"],
+                    "stop": entry - 5.0 if pending["side"] == "LONG" else entry + 5.0, # Initial 5 pt SL
+                    "target": entry + 10.0 if pending["side"] == "LONG" else entry - 10.0, # Initial 10 pt target
+                    "profit_locked": False
+                }
+                trades_today += 1
+                pending = None
 
-    if s["ticks_in_candle"] >= s["candle_seconds"]:
-        s["bar_index"] += 1
-        s["ticks_in_candle"] = 0
-        if s["bar_index"] == 3:
-            opening = s["candles"][:3]
-            s["opening_high"] = max(c["high"] for c in opening)
-            s["opening_low"] = min(c["low"] for c in opening)
-        signal, reason = signal_for_state()
-        s["last_signal"], s["last_reason"] = signal, reason
+            # Manage active position against high/low of current historical candle
+            if active is not None:
+                current_profit_pts = (float(row["close"]) - active["entry"]) if active["side"] == "LONG" else (active["entry"] - float(row["close"]))
+                
+                # PROFIT LOCK SYSTEM: Check if profit crosses ₹500
+                if current_profit_pts * int(qty) >= 500.0 and not active["profit_locked"]:
+                    active["profit_locked"] = True
+                    active["stop"] = active["entry"] + 5.0 if active["side"] == "LONG" else active["entry"] - 5.0
+                    active["target"] = active["entry"] + 15.0 if active["side"] == "LONG" else active["entry"] - 15.0
 
-        max_t = s.get("max_trades_session", 5)
-        w_bars = s.get("warmup_bars", 6)
-        halted = s["daily_pnl"] <= -daily_limit or s["trade_count"] >= max_t or s["bar_index"] < w_bars
-        if (auto_execute and not halted and s["position"] is None and signal in ("BUY CALL", "BUY PUT")
-                and s["bar_index"] - s["last_trade_bar"] >= 3):
-            entry = max(1.0, base_premium + np.random.normal(0, 2))
-            stop = max(1.0, entry - 5.0)
-            target = entry + 10.0
-            s["position"] = {
-                "side": "CALL" if signal == "BUY CALL" else "PUT",
-                "entry_time": s["sim_time"].strftime("%H:%M:%S"),
-                "entry_underlying": s["price"],
-                "last_underlying": s["price"],
-                "entry_premium": entry,
-                "premium": entry,
-                "quantity": lot_size,
-                "stop_premium": stop,
-                "initial_stop": stop,
-                "target_premium": target,
-                "risk_per_unit": 5.0,
-                "best_premium": entry,
-                "cost_estimate": costs_per_trade,
-                "unrealized": -costs_per_trade,
-                "profit_locked": False,
-            }
-            s["trade_count"] += 1
-            s["last_trade_bar"] = s["bar_index"]
+                exit_price, exit_reason = None, None
+                if active["side"] == "LONG":
+                    if float(row["low"]) <= active["stop"]:
+                        exit_price, exit_reason = active["stop"] - slippage_points, "Stop-loss (Locked +5)" if active["profit_locked"] else "Stop-loss (5 pt)"
+                    elif float(row["high"]) >= active["target"]:
+                        exit_price, exit_reason = active["target"] - slippage_points, "Target Hit (10+ pts)"
+                else:
+                    if float(row["high"]) >= active["stop"]:
+                        exit_price, exit_reason = active["stop"] + slippage_points, "Stop-loss (Locked +5)" if active["profit_locked"] else "Stop-loss (5 pt)"
+                    elif float(row["low"]) <= active["target"]:
+                        exit_price, exit_reason = active["target"] + slippage_points, "Target Hit (10+ pts)"
 
-if st.session_state.running:
-    st_autorefresh(interval=1000, key="simulator_tick")
-    for _ in range(int(speed)):
-        if not st.session_state.running:
-            break
-        process_tick()
-        if not st.session_state.running:
-            break
+                if exit_price is not None:
+                    sign = 1 if active["side"] == "LONG" else -1
+                    gross = (exit_price - active["entry"]) * int(qty) * sign
+                    net = gross - float(cost_per_trade)
+                    trades.append({
+                        "Session": str(session_key), 
+                        "Side": active["side"],
+                        "Entry time": active["entry_time"], 
+                        "Exit time": stamp,
+                        "Entry price": round(active["entry"], 2), 
+                        "Exit price": round(exit_price, 2),
+                        "Quantity": int(qty), 
+                        "Exit reason": exit_reason,
+                        "Net P&L ₹": round(net, 2)
+                    })
+                    daily_net += net
+                    equity += net
+                    peak_equity = max(peak_equity, equity)
+                    max_drawdown = max(max_drawdown, peak_equity - equity)
+                    active = None
+                    exited_this_bar = True
 
-s = st.session_state
-vwap, ema_fast, ema_slow, macro_trend, rvol = calculate_institutional_indicators(s["candles"])
-signal, reason = signal_for_state() if s["bar_index"] > 0 else (s["last_signal"], s["last_reason"])
+            if trades_today >= 5:
+                pending = None
+                continue
 
-if s["position"]:
-    display_signal = f"POSITION OPEN — {s['position']['side']}"
-else:
-    display_signal = s["last_signal"] if s["bar_index"] > 0 else "NO TRADE"
+            # Signal generation logic based on Rejection Candle & VWAP / EMA
+            ema_fast_v = row["ema_fast"]
+            ema_slow_v = row["ema_slow"]
+            spread = abs(ema_fast_v - ema_slow_v)
 
-st.subheader("1. Live Institutional Simulator Dashboard")
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Simulated NIFTY", f'{s["price"]:,.2f}', f'{s["price"]-s["prev_close"]:+.2f}')
-m2.metric("VWAP", f'{vwap:,.2f}' if vwap else "—")
-m3.metric("RVOL Spike", f'{rvol:.2f}x' if rvol else "—")
-max_t = s.get("max_trades_session", 5)
-m4.metric("Trades Today", f'{s["trade_count"]}/{max_t}')
+            if active is None and pending is None and not exited_this_bar and spread >= min_spread:
+                high_v = float(row["high"])
+                low_v = float(row["low"])
+                close_v = float(row["close"])
+                open_v = float(row["open"])
+                total_rng = high_v - low_v
+                
+                if total_rng > 0:
+                    lower_wk = min(close_v, open_v) - low_v
+                    upper_wk = high_v - max(close_v, open_v)
 
-if s["opening_high"] is not None:
-    st.write(f'**Opening Range:** {s["opening_low"]:,.2f} – {s["opening_high"]:,.2f}')
-else:
-    st.write("**Opening Range:** Waiting for establishment.")
+                    long_reject = (
+                        lower_wk > (total_rng * 0.45) and close_v > open_v
+                        and (low_v <= float(row["vwap"]) or low_v <= opening_high)
+                        and ema_fast_v > ema_slow_v
+                    )
+                    short_reject = (
+                        upper_wk > (total_rng * 0.45) and close_v < open_v
+                        and (high_v >= float(row["vwap"]) or high_v >= opening_low)
+                        and ema_fast_v < ema_slow_v
+                    )
 
-if display_signal == "BUY CALL":
-    st.success("🟢 BUY CALL — S-Tier Rejection & RVOL Confirmed")
-elif display_signal == "BUY PUT":
-    st.error("🔴 BUY PUT — S-Tier Rejection & RVOL Confirmed")
-elif display_signal.startswith("POSITION OPEN"):
-    st.info(f"📍 {display_signal}")
-else:
-    st.warning("🛡️ WARM-UP / INSTITUTIONAL FILTER ACTIVE")
-st.write(s["last_reason"])
+                    if long_reject:
+                        pending = {"side": "LONG", "time": stamp}
+                    elif short_reject:
+                        pending = {"side": "SHORT", "time": stamp}
 
-if s["candles"]:
-    cdf = pd.DataFrame(s["candles"])
-    cdf["time"] = pd.to_datetime(cdf["time"])
-    cdf = cdf.tail(60).set_index("time")
-    
-    chart_df = pd.DataFrame({"Close": cdf["close"]})
-    chart_df["EMA 9"] = cdf["close"].ewm(span=9).mean()
-    chart_df["EMA 21"] = cdf["close"].ewm(span=21).mean()
-    
-    st.line_chart(chart_df, height=250)
+        sessions.append({"Session": str(session_key), "Trades": len(trades) - session_trades_start, "Net P&L ₹": round(daily_net, 2)})
 
-st.divider()
-st.subheader("2. Open Position & Live P&L")
-pos = s["position"]
-if pos:
-    current_pnl = (pos["premium"] - pos["entry_premium"]) * pos["quantity"] - pos["cost_estimate"]
-    p1, p2, p3 = st.columns(3)
-    p1.metric("Option", f'BUY {pos["side"]}')
-    p2.metric("Entry premium", f'₹{pos["entry_premium"]:.2f}')
-    p3.metric("Current premium", f'₹{pos["premium"]:.2f}')
-    
-    p4, p5, p6 = st.columns(3)
-    p4.metric("Running P&L", f'₹{current_pnl:.2f}', delta=f'₹{current_pnl:.2f}')
-    p5.metric("Stop-loss", f'₹{pos["stop_premium"]:.2f} ({"LOCKED (+5 pts)" if pos.get("profit_locked") else "Initial 5 pt"})')
-    p6.metric("Target", f'₹{pos["target_premium"]:.2f}')
-else:
-    st.info("No open position. Waiting for high-conviction volume-backed rejection.")
+    return pd.DataFrame(trades), pd.DataFrame(sessions), max_drawdown
 
-r1, r2 = st.columns(2)
-r1.metric("Closed Session P&L", f'₹{s["daily_pnl"]:.2f}')
-r2.metric("Total Trades Executed", f'{s["trade_count"]}/{max_t}')
+if uploaded_csv is not None:
+    try:
+        raw_bt = _normalise_columns(pd.read_csv(uploaded_csv))
+        required_cols = {"open", "high", "low", "close"}
+        if required_cols.issubset(raw_bt.columns):
+            st.success("✅ CSV successfully parsed with OHLC structure!")
+            if st.button("▶️ Run Real Chart Backtest", type="primary"):
+                results_df, sessions_df, max_dd = run_historical_backtest(
+                    raw_bt, bt_lot_size, bt_costs, bt_slippage, bt_min_spread
+                )
+                if not results_df.empty:
+                    st.markdown("### 📊 Backtest Performance Summary")
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Total Net P&L", f"₹{results_df['Net P&L ₹'].sum():,.2f}")
+                    col2.metric("Total Trades Taken", len(results_df))
+                    col3.metric("Max Drawdown", f"₹{max_dd:,.2f}")
 
-if s["closed_trades"]:
-    st.dataframe(pd.DataFrame(s["closed_trades"]), use_container_width=True, hide_index=True)
+                    st.markdown("#### Detailed Trade Log")
+                    st.dataframe(results_df, use_container_width=True, hide_index=True)
+                    
+                    st.download_button(
+                        "Download Backtest Results CSV",
+                        data=results_df.to_csv(index=False).encode("utf-8"),
+                        file_name="real_chart_backtest_results.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.warning("No trades were triggered. Try lowering the Min EMA Separation filter or checking your candle data format.")
+        else:
+            st.error(f"Missing required columns. Your CSV must include: open, high, low, close. Found: {list(raw_bt.columns)}")
+    except Exception as e:
+        st.error(f"Error processing CSV: {e}")
